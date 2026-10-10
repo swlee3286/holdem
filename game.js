@@ -1,12 +1,14 @@
 // ===== 설정 =====
-// 2~6인 노리밋 홀덤 화면. 규칙은 table.js(PokerTable), AI는 gto.js(PokerAI), 카드·족보는 engine.js
+// 2~6인 노리밋 홀덤 화면. 규칙은 table.js(PokerTable), AI는 gto.js(PokerAI), 카드·족보는 engine.js, 온라인은 net.js(PokerNet)
 const SAVE_KEY = "holdem-table-v2";
 const HINT_KEY = "holdem-table-v2-hint";
+const ROOM_KEY = "holdem-room-v1";   // 방장: 방 · 매치 (새로고침하면 같은 코드로 다시 연다)
+const NET_KEY = "holdem-net-v1";     // 내 이름 · 손님 토큰 · 마지막으로 들어간 방
 const START_STACK = 2000;
 const HANDS_PER_LEVEL = 10;
 const LEVELS = [[10, 20], [15, 30], [20, 40], [30, 60], [40, 80], [50, 100], [75, 150], [100, 200], [150, 300], [200, 400], [300, 600], [400, 800], [500, 1000], [750, 1500], [1000, 2000]];
 const YOU = 0, CLAUDE = 1;
-// 좌석 0 = 나, 1 = Claude, 2~5 = AI 플레이어
+// 좌석 0 = 나, 1 = Claude, 2~5 = AI 플레이어 (친구와 하기: 0 = 방장, 1~ = 들어온 순서대로 손님, 나머지 AI)
 const ROSTER = [
   { name: "나", kind: "human", initial: "나", color: "var(--ivory)" },
   { name: "Claude", kind: "claude", initial: "C", color: "var(--clay)" },
@@ -18,12 +20,14 @@ const ROSTER = [
 const STREET_KO = ["프리플롭", "플롭", "턴", "리버"];
 const STREET_EN = ["Preflop", "Flop", "Turn", "River"];
 const PT = PokerTable;
+const PUBLIC_URL = "https://swlee3286.github.io/holdem/";
 
 // ===== 자리 배치 =====
 // 테이블 상자 기준 % 좌표. seat = 명패 가운데, bet = 베팅 칩 · 행동 표시 자리
 // 나는 아래 가운데, 좌석 번호가 커지는 방향(시계 방향) = 아래 → 왼쪽 → 위 → 오른쪽
 // wide = 가로로 긴 테이블(넓은 화면), tall = 세로로 긴 테이블(폰)
 // bubble = Claude 말풍선 위치 (기본: 명패 오른쪽, 오른쪽 자리면 왼쪽)
+// 배열 인덱스는 '화면 위치'다: (좌석 - 내 좌석 + 인원) % 인원. 혼자 하기에서는 좌석 번호와 같다
 const LAYOUT = {
   wide: {
     2: { seat: [[50, 100], [50, 0]], bet: [[50, 70], [50, 27]] },
@@ -41,7 +45,7 @@ const LAYOUT = {
   },
 };
 
-let S = null;          // 매치 상태 + 화면 기록 (localStorage에 저장)
+let S = null;          // 매치 상태 + 화면 기록 (혼자 하기 · 방장은 localStorage에 저장, 손님은 받은 화면으로 만든다)
 let sampleFn = null;   // claude.use("sample") — Claude에게 수를 묻는 함수
 let link = "checking"; // checking | live | paused | offline
 let thinking = null;   // Claude 차례 진행 중: { hand, ctl, n }
@@ -54,15 +58,37 @@ let hint = { key: "", d: null };
 let controlsKey = "", logKey = "", tableKey = "";
 let turnKey = "", turnAt = 0; // 내 차례 버튼이 새로 나타난 때: 더블클릭·연타가 새 버튼을 누르지 않게 잠깐 막는다
 const INPUT_LOCK_MS = 350;
-let setup = { n: 6, claude: true }; // 설정 창에서 고른 값
+let setup = { n: 6, claude: true, tab: "solo", resume: false, name: "", code: "", link: false, err: "", mpN: 4 }; // 설정 창에서 고른 값 (link: 참가 링크로 들어옴)
+let modalScreen = "";  // 지금 열린 창 이름 (로비처럼 내용만 바꿔 그리는 창)
 const tallMQ = window.matchMedia("(max-width: 600px)");
 
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Number(n).toLocaleString("ko-KR");
 const esc = (s) => String(s).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
 const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
-const nm = (s) => (s === YOU ? "나" : S.m.players[s].name);
+const nm = (s) => (s === ME ? "나" : S.m.players[s].name);
 const pct = (a, b) => (b ? `${Math.round((100 * a) / b)}%` : "n/a");
+
+// ===== 친구와 하기: 설정 =====
+// 방장 브라우저가 딜러(진짜 매치)이고, 손님은 자기 자리 화면만 받아 그린다. 전송은 net.js
+const QS = new URLSearchParams(location.search);
+const NET_KIND = QS.get("net") === "local" ? "local" : "peer"; // ?net=local: 같은 브라우저 탭끼리 (테스트용)
+const numParam = (k, d, lo, hi) => {
+  const v = Number(QS.get(k));
+  return QS.has(k) && Number.isFinite(v) ? clamp(v, lo, hi) : d;
+};
+const TURN_MS = numParam("turnSec", 30, 5, 120) * 1000; // 사람 차례 제한 시간
+const NEXT_MS = numParam("nextSec", 5, 1, 30) * 1000;   // 핸드가 끝나고 다음 핸드까지
+const RESUME_MS = 20 * 60 * 1000;                       // 방장 새로고침 · 손님 재접속을 이어 주는 시간
+
+let mode = "solo";     // solo | host | guest
+let ME = 0;            // 화면 아래 가운데에 앉는 내 좌석
+let net = null;        // PokerNet.createHost / createClient
+let room = null;       // 방장: { code, n, hostName, started, guests, peerToken, ready, status, note, error }
+let guest = null;      // 손님: { code, name, seat, status, lobby, view, at, pending, gone }
+let turnTimer = 0, nextTimer = 0, tickTimer = 0, pendTimer = 0, toastTimer = 0, retryTimer = 0;
+let wakeLock = null;
+let profile = loadProfile();
 
 try { hintOn = localStorage.getItem(HINT_KEY) === "1"; } catch {}
 
@@ -77,6 +103,9 @@ const sampleReady = (async () => {
   renderTop();
   return sampleFn;
 })();
+
+// 친구와 하기를 쓸 수 있는지: 아티팩트 안에서는 외부 연결이 막혀 있어 안 된다 (GitHub Pages · 로컬에서만)
+const netOk = () => typeof PokerNet === "object" && !window.claude && PokerNet.supported(NET_KIND);
 
 // ===== 매치 =====
 function newMatch(n, claudeOn) {
@@ -105,33 +134,39 @@ function newMatch(n, claudeOn) {
 
 function startHand() {
   const m = S.m;
-  if (m.over || (m.hand && m.hand.phase !== "done")) return;
+  if (mode === "guest" || m.over || (m.hand && m.hand.phase !== "done")) return;
   stopAll();
   PT.startHand(m);
   const h = m.hand;
-  S.log = [];
-  S.logAt = { a: 0, street: 0, shown: false, done: false };
   S.say = null;
   S.track = { vpip: false, pfr: false };
-  if (!m.players[YOU].out) fast = false;
-  addLog(`블라인드 ${h.sb}/${h.bb} · 버튼 ${esc(nm(h.button))} · ${h.seats.length}명`);
-  if (h.seats.includes(YOU)) {
-    S.stats.hands++;
-    addLog(`내 카드 ${cardsHtml(h.hole[YOU])} · ${PT.positionsOf(h)[YOU]}`);
-  }
+  if (mode === "host") { S.turn = null; S.nextAt = 0; }
+  if (!m.players[ME].out) fast = false;
+  if (h.seats.includes(ME)) S.stats.hands++;
+  beginLog(h);
   advance();
+}
+
+// 새 핸드의 첫 기록 줄
+function beginLog(h) {
+  S.log = [];
+  S.logAt = { a: 0, street: 0, shown: false, done: false };
+  addLog(`블라인드 ${h.sb}/${h.bb} · 버튼 ${esc(nm(h.button))} · ${h.seats.length}명`);
+  if (h.seats.includes(ME) && h.hole[ME]?.[0] != null) addLog(`내 카드 ${cardsHtml(h.hole[ME])} · ${PT.positionsOf(h)[ME]}`);
 }
 
 function stopAll() {
   clearTimeout(timer);
   clearTimeout(endTimer);
+  clearTimeout(turnTimer);
+  clearTimeout(nextTimer);
   if (thinking) { thinking.stopped = true; thinking.ctl.abort(); } // 멈춤(설정 창 등): 이 수는 두지 않고, 이어하면 다시 묻는다
   thinking = null;
 }
 
-// 상태가 바뀔 때마다: 기록 · 저장 · 그리기, 그리고 다음 차례를 예약한다
+// 상태가 바뀔 때마다: 기록 · 저장 · 그리기, 그리고 다음 차례를 예약한다 (손님은 방장이 보낸 화면만 그린다)
 function advance() {
-  if (!S) return;
+  if (!S || mode === "guest") return;
   const m = S.m, h = m.hand;
   clearTimeout(timer);
   syncLog();
@@ -142,6 +177,13 @@ function advance() {
       clearTimeout(endTimer);
       endTimer = setTimeout(showEnd, 1600);
     }
+  }
+  if (mode === "host") {
+    if (room?.ready) hostSchedule();
+    save();
+    render();
+    hostBroadcast();
+    return;
   }
   save();
   render();
@@ -174,19 +216,21 @@ function claudeWanted(h) {
 function botTurn(m, h, seat) {
   if (!S || S.m !== m || m.hand !== h || h.phase !== "bet" || h.toAct !== seat) return;
   const mv = engineMove(m, seat);
-  doAct(seat, mv.action, mv.to);
+  doAct(seat, mv.action, mv.to, "", m.players[seat].kind === "remote" ? "auto" : ""); // 연결이 끊긴 손님 자리는 AI가 대신
 }
 
-// 누구의 수든 여기로: 성향 집계 · 말 기록 → 규칙 엔진 → 다음
-function doAct(seat, type, to, say) {
+// 누구의 수든 여기로: 성향 집계 · 말 기록 → 규칙 엔진 → 다음. flag: 행동 기록에 붙일 표시 (timeout · auto)
+function doAct(seat, type, to, say, flag) {
   const m = S.m, h = m.hand, L = PT.legal(m, seat);
   if (seat === YOU) trackHuman(h, type, L);
   if (say) addLog(`<span class="said">${esc(nm(seat))}: “${esc(say)}”</span>`);
+  let rec;
   try {
-    PT.act(m, seat, type, to);
+    rec = PT.act(m, seat, type, to);
   } catch {
-    PT.act(m, seat, L.toCall === 0 ? "check" : "fold"); // 규칙상 안 되는 수가 들어오면 체크 또는 폴드
+    rec = PT.act(m, seat, L.toCall === 0 ? "check" : "fold"); // 규칙상 안 되는 수가 들어오면 체크 또는 폴드
   }
+  if (flag && rec) rec[flag] = true;
   advance();
 }
 
@@ -196,31 +240,32 @@ function handDone(h) {
   S.doneNo = h.no;
   const m = S.m, r = h.result;
   S.biggestPot = Math.max(S.biggestPot, r.pots.reduce((t, p) => t + p.amount, 0));
-  if (r.showdown && r.hands[YOU]) {
+  if (S.stats && r.showdown && r.hands[ME]) {
     S.stats.showdowns = [...S.stats.showdowns, {
-      cards: h.hole[YOU].map(cardCode).join(""), hand: describeEn(r.hands[YOU].score), board: h.board.map(cardCode).join(" "),
+      cards: h.hole[ME].map(cardCode).join(""), hand: describeEn(r.hands[ME].score), board: h.board.map(cardCode).join(" "),
     }].slice(-4);
   }
-  const net = h.seats.includes(YOU) ? m.players[YOU].stack - h.start[YOU] : null;
-  S.history = [{ no: h.no, net, log: S.log.slice() }, ...S.history].slice(0, 30);
+  const gain = h.seats.includes(ME) ? m.players[ME].stack - h.start[ME] : null;
+  S.history = [{ no: h.no, net: gain, log: S.log.slice() }, ...S.history].slice(0, 30);
 }
 
-const needsEndModal = () => (S.m.over && S.ended !== "over") || (S.m.players[YOU].out && !S.ended);
+const needsEndModal = () => (S.m.over && S.ended !== "over") || (S.m.players[ME].out && !S.ended);
 
 function showEnd() {
   if (!S || !$("modal").hidden) return;
   if (S.m.over) S.ended = "over";
-  else if (S.m.players[YOU].out) S.ended = "bust";
+  else if (S.m.players[ME].out) S.ended = "bust";
   else return;
   save();
   controlsKey = "";
   render();
-  openModal(endHtml());
+  openModal(endHtml(), "end");
 }
 
 // ===== 내 성향 기록 (Claude 프롬프트에 들어간다) =====
 function trackHuman(h, type, L) {
   const st = S.stats, t = S.track;
+  if (!st || !t) return;
   if (h.street === 0) {
     if (((type === "call" && L.toCall > 0) || type === "raise") && !t.vpip) { st.vpip++; t.vpip = true; }
     if (type === "raise" && !t.pfr) { st.pfr++; t.pfr = true; }
@@ -417,13 +462,14 @@ function historyEn(h, seat, pos, who) {
 // ===== 내 수 =====
 function userAct(type, to) {
   const h = S?.m.hand;
-  if (!h || h.phase !== "bet" || h.toAct !== YOU) return;
+  if (!h || h.phase !== "bet" || h.toAct !== ME) return;
   if (performance.now() - turnAt < INPUT_LOCK_MS) return; // 버튼이 방금 바뀌었다: 앞 수의 두 번째 클릭·키로 본다
-  const L = PT.legal(S.m, YOU);
+  const L = PT.legal(S.m, ME);
   if (type === "fold" && L.toCall === 0) return;
   if (type === "raise" && !L.canRaise) return;
   if (type === "call" && L.toCall === 0) type = "check";
-  doAct(YOU, type, to);
+  if (mode === "guest") { guestSend(h, L, type, to); return; }
+  doAct(ME, type, to);
 }
 
 function raiseAmount() {
@@ -439,20 +485,24 @@ function addLog(html) {
 function actionKo(a, short) {
   if (short && a.allin && a.type !== "fold") return "올인";
   const tail = a.allin ? " (올인)" : "";
+  let s;
   switch (a.type) {
-    case "fold": return "폴드";
-    case "check": return "체크";
-    case "call": return `콜 ${fmt(a.amount)}${tail}`;
-    case "bet": return `벳 ${fmt(a.to)}${tail}`;
-    default: return `레이즈 → ${fmt(a.to)}${tail}`;
+    case "fold": s = "폴드"; break;
+    case "check": s = "체크"; break;
+    case "call": s = `콜 ${fmt(a.amount)}${tail}`; break;
+    case "bet": s = `벳 ${fmt(a.to)}${tail}`; break;
+    default: s = `레이즈 → ${fmt(a.to)}${tail}`;
   }
+  if (!short && a.timeout) s += " · 시간 초과";
+  else if (!short && a.auto) s += " · AI가 대신";
+  return s;
 }
 
 function cardsHtml(cs) {
   return cs.map((c) => `<span class="lc${isRed(c) ? " red" : ""}">${cardLabel(c)}</span>`).join(" ");
 }
 
-// 규칙 엔진의 행동 목록을 따라가며 아직 옮기지 않은 줄을 기록에 더한다
+// 규칙 엔진의 행동 목록을 따라가며 아직 옮기지 않은 줄을 기록에 더한다 (손님도 받은 화면으로 같은 기록을 만든다)
 function syncLog() {
   const h = S.m.hand, at = S.logAt;
   const streetLine = (to) => {
@@ -471,7 +521,7 @@ function syncLog() {
   }
   if (h.phase === "runout" && !at.shown) {
     at.shown = true;
-    const shown = h.seats.filter((s) => h.shown[s]).map((s) => `${esc(nm(s))} ${cardsHtml(h.hole[s])}`);
+    const shown = h.seats.filter((s) => h.shown[s] && h.hole[s]?.[0] != null).map((s) => `${esc(nm(s))} ${cardsHtml(h.hole[s])}`);
     addLog(`올인 — 카드 공개: ${shown.join(" · ")}`);
   }
   streetLine(h.street);
@@ -481,7 +531,7 @@ function syncLog() {
     if (r.showdown) {
       for (const s of h.seats) {
         const hand = r.hands[s];
-        if (hand) addLog(`${esc(nm(s))} ${cardsHtml(h.hole[s])} — ${esc(hand.label)}`);
+        if (hand && h.hole[s]?.[0] != null) addLog(`${esc(nm(s))} ${cardsHtml(h.hole[s])} — ${esc(hand.label)}`);
       }
     }
     r.pots.forEach((p, i) => {
@@ -494,7 +544,8 @@ function syncLog() {
 
 // ===== 저장 =====
 function save() {
-  try { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); } catch {}
+  if (mode === "solo") { try { localStorage.setItem(SAVE_KEY, JSON.stringify(S)); } catch {} }
+  else if (mode === "host") saveRoom();
 }
 
 function load() {
@@ -512,7 +563,7 @@ function load() {
 
 // ===== 화면 =====
 function render() {
-  if (!S) return;
+  if (!S || !S.m?.hand) return;
   buildTable(S.m.players.length);
   renderTop();
   renderSeats();
@@ -520,11 +571,15 @@ function render() {
   renderBubble();
   renderControls();
   renderLog();
+  renderClocks();
 }
 
 function renderTop() {
   const dot = $("link-dot");
   if (!dot) return;
+  if (mode !== "solo") { renderTopNet(); return; }
+  document.querySelector(".brand span").textContent = "vs Claude";
+  $("new-game").textContent = "새 게임";
   const on = !S || S.claudeOn;
   const state = link === "live" && !on ? "engine" : link;
   dot.className = "dot " + state;
@@ -544,45 +599,100 @@ function renderTop() {
   seg.hidden = !(link === "live" && on);
   $("retry").hidden = link !== "paused";
   for (const b of seg.querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.dataset.depth === (S?.depth ?? "quick")));
+  renderLevel();
+}
+
+function renderLevel() {
   const lv = $("level");
-  if (!S) {
-    lv.innerHTML = `블라인드 <b>10/20</b> · <span>${setup.n}명</span>`;
+  if (!S || !S.m?.hand) {
+    lv.innerHTML = mode === "solo" ? `블라인드 <b>10/20</b> · <span>${setup.n}명</span>` : `블라인드 <b>10/20</b>`;
     return;
   }
-  const m = S.m, h = m.hand, left = HANDS_PER_LEVEL - ((m.handNo - 1) % HANDS_PER_LEVEL);
+  const m = S.m, h = m.hand, per = m.handsPerLevel || HANDS_PER_LEVEL, left = per - ((m.handNo - 1) % per);
   const [nsb, nbb] = PT.blindsAt(m, m.handNo + left);
   lv.innerHTML = `핸드 <b>#${m.handNo}</b> · 블라인드 <b>${h.sb}/${h.bb}</b>` +
     (nbb !== h.bb ? ` · <span>${left}핸드 뒤 ${nsb}/${nbb}</span>` : "") +
     ` · <em>${PT.liveSeats(m).length}/${m.players.length}명 남음</em>`;
 }
 
-// 인원 · 화면 모양이 바뀔 때만 자리를 새로 만든다
+// 친구와 하기: 위 막대에 방 코드와 연결 상태
+function renderTopNet() {
+  document.querySelector(".brand span").textContent = "친구와";
+  $("new-game").textContent = "나가기";
+  $("depth").hidden = true;
+  $("retry").hidden = true;
+  let state, text, title;
+  const code = (mode === "host" ? room?.code : guest?.code) || "·····";
+  if (mode === "host") {
+    const total = room.guests.length, on = room.guests.filter((g) => g.connected).length;
+    state = !room.ready ? "checking" : room.status === "offline" ? "paused" : "live";
+    text = !room.ready ? `방 ${code} 여는 중` : `방 ${code} · 친구 ${on}/${total}명 연결`;
+    title = "내 기기가 딜러예요. 게임이 끝날 때까지 이 화면을 켜 두세요." + (room.status === "offline" ? " 서버와 잠깐 끊겼어요(들어와 있는 친구와는 계속 연결돼요). 다시 연결하는 중이에요." : "");
+  } else {
+    const st = guest.status;
+    state = st === "open" ? "live" : st === "reconnecting" ? "paused" : "checking";
+    text = st === "open" ? `방 ${code} · 연결됨` : st === "reconnecting" ? `방 ${code} · 다시 연결 중…` : `방 ${code} · 연결 중…`;
+    title = "방장 기기가 딜러예요. 연결이 끊기면 내 자리는 AI가 대신 두고, 다시 연결되면 돌려받아요.";
+  }
+  $("link-dot").className = "dot " + state;
+  $("link-text").textContent = text;
+  $("link-short").textContent = code;
+  $("link").title = title;
+  renderLevel();
+}
+
+// 자리에 보일 이름 · 머리글자 · 색
+function seatLook(s) {
+  const r = ROSTER[s];
+  if (mode === "solo" || !S?.m) return r;
+  const name = S.m.players[s].name;
+  return { name, initial: name === r.name ? r.initial : Array.from(name)[0] || "?", color: r.color };
+}
+
+// 친구와 하기: 그 자리가 연결돼 있는지 (AI 자리는 늘 true)
+function seatOnline(s) {
+  if (mode === "host") {
+    const p = S.m.players[s];
+    if (p.kind !== "remote") return true;
+    const g = PokerNet.roomGuestAt(room, s);
+    return !!g && g.connected;
+  }
+  if (mode === "guest") return S.m.players[s].connected !== false;
+  return true;
+}
+
+// 인원 · 화면 모양 · 내 자리가 바뀔 때만 자리를 새로 만든다
 function buildTable(n) {
-  const mode = tallMQ.matches ? "tall" : "wide", key = `${n}|${mode}`;
+  const shape = tallMQ.matches ? "tall" : "wide";
+  const names = S?.m ? S.m.players.map((p) => p.name).join("|") : "";
+  const key = `${n}|${shape}|${mode}|${ME}|${names}`;
   if (key === tableKey) return;
   tableKey = key;
-  const lay = LAYOUT[mode][n];
+  const lay = LAYOUT[shape][n], me = mode === "solo" ? YOU : ME;
   let html = "";
   for (let s = 0; s < n; s++) {
-    const r = ROSTER[s], [x, y] = lay.seat[s], [bx, by] = lay.bet[s];
-    const cls = ["seat", s === YOU ? "me" : "", s === CLAUDE ? "claude" : "", y < 45 ? "below" : "", x < 30 ? "west" : x > 70 ? "east" : ""].filter(Boolean).join(" ");
+    const d = (s - me + n) % n; // 화면 위치: 나는 늘 아래 가운데
+    const r = seatLook(s), [x, y] = lay.seat[d], [bx, by] = lay.bet[d];
+    const claudeSeat = mode === "solo" && s === CLAUDE;
+    const cls = ["seat", s === me ? "me" : "", claudeSeat ? "claude" : "", y < 45 ? "below" : "", x < 30 ? "west" : x > 70 ? "east" : ""].filter(Boolean).join(" ");
     html += `
       <div class="${cls}" id="seat-${s}" style="left:${x}%;top:${y}%">
         <div class="hole" id="hole-${s}"></div>
         <div class="plate">
-          <span class="avatar" style="--av:${r.color}" aria-hidden="true">${r.initial}</span>
-          <span class="who"><span class="nm"><b>${esc(r.name)}</b><i class="pos" id="pos-${s}"></i></span><span class="stack" id="stack-${s}">${fmt(START_STACK)}</span></span>
+          <span class="avatar" style="--av:${r.color}" aria-hidden="true">${esc(r.initial)}</span>
+          <span class="who"><span class="nm"><b>${esc(r.name)}</b><i class="pos" id="pos-${s}"></i></span><span class="stack" id="stack-${s}">${fmt(START_STACK)}</span><span class="away-note" id="away-${s}" hidden><span class="al">연결 끊김 · AI가 대신</span><span class="as">끊김 · AI</span></span></span>
           <span class="dealer" id="dealer-${s}" hidden>D</span>
+          <span class="clock" id="clock-${s}" hidden></span>
         </div>
-        ${s === YOU ? `<span class="made" id="made"></span>` : ""}
-        ${s === CLAUDE ? `<div class="bubble${lay.bubble ? ` ${lay.bubble}` : x > 60 ? " to-left" : ""}" id="bubble" aria-live="polite"></div>` : ""}
+        ${s === me ? `<span class="made" id="made"></span>` : ""}
+        ${claudeSeat ? `<div class="bubble${lay.bubble ? ` ${lay.bubble}` : x > 60 ? " to-left" : ""}" id="bubble" aria-live="polite"></div>` : ""}
       </div>
       <div class="bet${y < 45 ? " up" : ""}" id="bet-${s}" style="left:${bx}%;top:${by}%"></div>`;
   }
   $("seats").innerHTML = html;
   const t = $("table");
   t.dataset.n = n;
-  t.dataset.mode = mode;
+  t.dataset.mode = shape;
   controlsKey = "";
 }
 
@@ -613,27 +723,29 @@ function renderSeats() {
   m.players.forEach((p, s) => {
     const el = $(`seat-${s}`);
     if (!el) return;
-    const inHand = h.seats.includes(s), folded = inHand && h.folded[s];
+    const inHand = h.seats.includes(s), folded = inHand && h.folded[s], online = seatOnline(s);
     el.classList.toggle("turn", h.phase === "bet" && h.toAct === s);
     el.classList.toggle("folded", folded);
     el.classList.toggle("out", p.out && !inHand);
     el.classList.toggle("busted", p.out);
     el.classList.toggle("thinking", !!(thinking && thinking.hand === h && s === CLAUDE));
     el.classList.toggle("winner", done && h.result.won[s] > 0);
+    el.classList.toggle("away", !online && !p.out);
+    $(`away-${s}`).hidden = online || p.out;
     $(`stack-${s}`).textContent = p.out && (done || !inHand) ? "탈락"
       : inHand && !folded && p.stack === 0 && !done ? "올인" : fmt(p.stack);
     $(`pos-${s}`).textContent = inHand ? pos[s] ?? "" : "";
     $(`dealer-${s}`).hidden = h.button !== s;
     let cards = [];
-    if (inHand && (!folded || s === YOU)) cards = h.hole[s].map((c) => (s === YOU || h.shown[s] ? c : "back"));
+    if (inHand && (!folded || s === ME) && h.hole[s]) cards = h.hole[s].map((c) => (c !== null && (s === ME || h.shown[s]) ? c : "back"));
     renderCards($(`hole-${s}`), cards, (c) => (c === "back" ? "" : folded ? "dim" : sd && h.shown[s] ? (best.has(c) ? "win" : "dim") : ""));
     renderBet(s, h, inHand);
   });
   // 지금 내 패 이름 (보드가 깔린 뒤)
   const made = $("made");
   if (made) {
-    const mine = h.seats.includes(YOU) && !h.folded[YOU] && h.board.length >= 3 && h.phase !== "done"; // 끝나면 베팅 자리에 족보가 뜬다
-    made.textContent = mine ? describe(evaluate([...h.hole[YOU], ...h.board])) : "";
+    const mine = h.seats.includes(ME) && !h.folded[ME] && h.board.length >= 3 && h.phase !== "done" && h.hole[ME]?.[0] != null; // 끝나면 베팅 자리에 족보가 뜬다
+    made.textContent = mine ? describe(evaluate([...h.hole[ME], ...h.board])) : "";
   }
 }
 
@@ -746,35 +858,38 @@ function cardNode(c) {
 // ===== 조작판 =====
 function renderControls() {
   const m = S.m, h = m.hand, box = $("controls");
-  const key = [h.no, h.actions.length, h.phase, h.toAct, h.street, m.over, !!thinking, fast, hintOn, S.ended, m.players[YOU].out].join("|");
+  const online = h.toAct >= 0 ? seatOnline(h.toAct) : true;
+  const key = [h.no, h.actions.length, h.phase, h.toAct, h.street, m.over, !!thinking, fast, hintOn, S.ended, m.players[ME].out, mode, ME, guest?.pending ? 1 : 0, online].join("|");
   if (key === controlsKey) return;
   controlsKey = key;
-  box.classList.toggle("mine", h.phase === "bet" && h.toAct === YOU);
+  box.classList.toggle("mine", h.phase === "bet" && h.toAct === ME);
   if (h.phase === "done") box.innerHTML = doneHtml(h);
-  else if (h.phase === "bet" && h.toAct === YOU) {
+  else if (h.phase === "bet" && h.toAct === ME) {
     const tk = `${m.handNo}|${h.actions.length}`;
     if (tk !== turnKey) { turnKey = tk; turnAt = performance.now(); }
-    const L = PT.legal(m, YOU);
+    const L = PT.legal(m, ME);
     box.innerHTML = myTurnHtml(h, L);
     syncRaiseLabel(L);
   } else box.innerHTML = waitHtml(h);
 }
 
 function waitHtml(h) {
-  const m = S.m, out = !h.seats.includes(YOU) || h.folded[YOU] || m.players[YOU].stack === 0;
+  const m = S.m, out = !h.seats.includes(ME) || h.folded[ME] || m.players[ME].stack === 0;
   let msg;
   if (h.phase === "runout") msg = "남은 카드를 펼치는 중…";
   else if (thinking && thinking.hand === h) msg = "Claude가 생각 중…";
-  else msg = `${esc(nm(h.toAct))} 차례예요`;
-  if (m.players[YOU].out) msg = `관전 중 · ${msg}`;
-  const ff = out
+  else if (mode !== "solo" && !seatOnline(h.toAct)) msg = `${esc(nm(h.toAct))} 연결 끊김 · AI가 대신 둡니다`;
+  else msg = `${esc(nm(h.toAct))} 차례예요${mode !== "solo" ? ` <span class="wait-clock" id="wait-clock"></span>` : ""}`;
+  if (m.players[ME].out) msg = `관전 중 · ${msg}`;
+  const ff = out && mode === "solo"
     ? `<button class="btn ff${fast ? " on" : ""}" id="fast" type="button" aria-pressed="${fast}">${fast ? "빨리 감는 중" : "빨리 감기"} <span aria-hidden="true">»</span></button>`
     : "";
   return `<div class="waiting"><span>${msg}</span>${ff}</div>`;
 }
 
 function myTurnHtml(h, L) {
-  const m = S.m, me = m.players[YOU], pot = PT.potTotal(h), pos = PT.positionsOf(h)[YOU];
+  const m = S.m, me = m.players[ME], pot = PT.potTotal(h), pos = PT.positionsOf(h)[ME];
+  const lock = mode === "guest" && !!guest.pending ? " disabled" : ""; // 보낸 수의 답(새 화면)이 올 때까지
   const callLabel = L.toCall === 0 ? "체크" : `콜 ${fmt(L.toCall)}${L.toCall >= me.stack ? " (올인)" : ""}`;
   const presets = [];
   if (L.canRaise) {
@@ -795,16 +910,17 @@ function myTurnHtml(h, L) {
   const start = L.canRaise ? clamp(Math.round(startTo / h.sb) * h.sb, L.minTo, L.maxTo) : 0;
   const onlyAllIn = L.canRaise && L.minTo === L.maxTo;
   const odds = L.toCall ? ` · 팟 오즈 ${Math.round((100 * L.toCall) / (pot + L.toCall))}%` : "";
+  const head = lock ? `<b>보내는 중…</b>` : `<b>내 차례</b>`;
   return `
     <div class="ctl-head">
-      <span class="ctl-info"><b>내 차례</b> · ${pos} · 팟 ${fmt(pot)}${odds}</span>
+      <span class="ctl-info">${head} · ${pos} · 팟 ${fmt(pot)}${odds}${mode !== "solo" ? ` <span class="my-clock" id="my-clock"></span>` : ""}</span>
       <button class="toggle" id="hint-toggle" type="button" aria-pressed="${hintOn}"><i aria-hidden="true"></i>GTO 힌트</button>
     </div>
     ${hintOn ? hintHtml(h, L) : ""}
     <div class="actions">
-      <button class="btn fold" id="b-fold" type="button" ${L.toCall === 0 ? "disabled" : ""}>폴드 <kbd>F</kbd></button>
-      <button class="btn call" id="b-call" type="button">${callLabel} <kbd>C</kbd></button>
-      <button class="btn raise" id="b-raise" type="button" ${L.canRaise ? "" : "disabled"}></button>
+      <button class="btn fold" id="b-fold" type="button" ${L.toCall === 0 || lock ? "disabled" : ""}>폴드 <kbd>F</kbd></button>
+      <button class="btn call" id="b-call" type="button"${lock}>${callLabel} <kbd>C</kbd></button>
+      <button class="btn raise" id="b-raise" type="button" ${L.canRaise && !lock ? "" : "disabled"}></button>
     </div>
     ${L.canRaise && !onlyAllIn ? `
     <div class="sizer">
@@ -814,12 +930,12 @@ function myTurnHtml(h, L) {
     </div>` : `<input type="hidden" id="amt" value="${L.maxTo}">`}`;
 }
 
-// 내 자리에서 GTO 엔진이 고르는 비율 (내 카드는 내 정보이므로 써도 된다)
+// 내 자리에서 GTO 엔진이 고르는 비율 (내 카드는 내 정보이므로 써도 된다. 손님은 받은 화면으로 계산)
 function hintHtml(h, L) {
-  const key = `${S.m.handNo}|${h.actions.length}`;
+  const key = `${S.m.handNo}|${h.actions.length}|${ME}`;
   if (hint.key !== key) {
     let d = null;
-    try { d = PokerAI.decide(S.m, YOU, { rng: Math.random }); } catch { d = null; }
+    try { d = PokerAI.decide(S.m, ME, { rng: Math.random }); } catch { d = null; }
     hint = { key, d };
   }
   const d = hint.d;
@@ -847,24 +963,25 @@ function doneHtml(h) {
   const rows = r.pots.map((p, i) => {
     const title = r.pots.length === 1 ? "팟" : i === 0 ? "메인 팟" : `사이드 팟 ${i}`;
     const names = p.winners.map((s) => esc(nm(s))).join("·") + (p.winners.length > 1 ? " 나눔" : "");
-    const how = r.showdown ? esc(r.hands[p.winners[0]].label) : "모두 폴드";
+    const how = r.showdown ? esc(r.hands[p.winners[0]]?.label ?? "") : "모두 폴드";
     return `<li><span class="r-pot">${title} <b>${fmt(p.amount)}</b></span><span class="r-win">${names} <small>${how}</small></span></li>`;
   }).join("");
-  let net;
-  if (!h.seats.includes(YOU)) net = `<div class="net">관전</div>`;
+  let gain;
+  if (!h.seats.includes(ME)) gain = `<div class="net">관전</div>`;
   else {
-    const v = m.players[YOU].stack - h.start[YOU];
-    net = `<div class="net ${v > 0 ? "up" : v < 0 ? "down" : ""}">내 손익 <b>${v > 0 ? "+" : ""}${fmt(v)}</b></div>`;
+    const v = m.players[ME].stack - h.start[ME];
+    gain = `<div class="net ${v > 0 ? "up" : v < 0 ? "down" : ""}">내 손익 <b>${v > 0 ? "+" : ""}${fmt(v)}</b></div>`;
   }
-  const btn = m.over
-    ? `<button class="btn primary" id="show-end" type="button">최종 결과 보기 <kbd>Enter</kbd></button>`
-    : m.players[YOU].out && !S.ended
-      ? `<button class="btn primary" id="show-end" type="button">결과 보기 <kbd>Enter</kbd></button>`
-      : `<button class="btn primary" id="next" type="button">다음 핸드 <kbd>Enter</kbd></button>`;
+  let btn;
+  if (m.over) btn = `<button class="btn primary" id="show-end" type="button">최종 결과 보기 <kbd>Enter</kbd></button>`;
+  else if (m.players[ME].out && !S.ended) btn = `<button class="btn primary" id="show-end" type="button">결과 보기 <kbd>Enter</kbd></button>`;
+  else if (mode === "guest") btn = `<div class="next-wait" id="next-clock" aria-live="off">다음 핸드를 기다리는 중</div>`; // 다음 핸드는 방장이 연다
+  else if (mode === "host") btn = `<button class="btn primary" id="next" type="button">다음 핸드<span class="next-in" id="next-clock"></span> <kbd>Enter</kbd></button>`;
+  else btn = `<button class="btn primary" id="next" type="button">다음 핸드 <kbd>Enter</kbd></button>`;
   return `
     <div class="done">
       <ul class="result" aria-live="polite">${rows}</ul>
-      ${net}
+      ${gain}
       ${btn}
     </div>`;
 }
@@ -893,19 +1010,85 @@ function renderLog() {
   }).join("");
 }
 
+// ===== 시계 (친구와 하기: 차례 제한 시간 · 다음 핸드) =====
+// 방장은 자기 시계로, 손님은 받은 '남은 시간'과 받은 때로 센다 (기기마다 시계가 달라서)
+function turnLeft() {
+  if (mode === "host" && S?.turn) return { seat: S.turn.seat, left: Math.max(0, S.turn.deadline - Date.now()), total: TURN_MS };
+  const v = guest?.view;
+  if (mode === "guest" && v?.turn) return { seat: v.turn.seat, left: Math.max(0, guest.at + v.turn.left - performance.now()), total: v.turn.total };
+  return null;
+}
+function nextLeft() {
+  if (mode === "host") return S?.nextAt ? Math.max(0, S.nextAt - Date.now()) : null;
+  const v = guest?.view;
+  return mode === "guest" && v && v.next !== null ? Math.max(0, guest.at + v.next - performance.now()) : null;
+}
+
+function renderClocks() {
+  if (mode === "solo" || !S?.m?.hand) return;
+  const h = S.m.hand, t = h.phase === "bet" ? turnLeft() : null;
+  const sec = (ms) => Math.ceil(ms / 1000);
+  S.m.players.forEach((_, s) => {
+    const el = $(`clock-${s}`);
+    if (!el) return;
+    const on = !!t && t.seat === s && h.toAct === s;
+    el.hidden = !on;
+    if (on) {
+      el.textContent = sec(t.left);
+      el.classList.toggle("urgent", t.left <= 10000);
+    }
+  });
+  for (const id of ["my-clock", "wait-clock"]) {
+    const el = $(id);
+    if (!el) continue;
+    const on = !!t && t.seat === h.toAct;
+    el.textContent = on ? `${sec(t.left)}초` : "";
+    el.classList.toggle("urgent", on && t.left <= 10000);
+  }
+  const nx = $("next-clock");
+  if (nx && h.phase === "done") {
+    const left = nextLeft();
+    if (mode === "guest") nx.textContent = left === null ? "다음 핸드를 기다리는 중" : `다음 핸드 ${sec(left)}초 뒤`;
+    else nx.textContent = left === null ? "" : ` · ${sec(left)}초`;
+  }
+}
+
+function startTicker() {
+  clearInterval(tickTimer);
+  tickTimer = setInterval(renderClocks, 250);
+}
+
 // ===== 창 =====
-function openModal(html) {
+function openModal(html, screen = "") {
+  modalScreen = screen;
   $("modal-card").innerHTML = html;
   $("modal").hidden = false;
   const card = $("modal-card");
-  (card.querySelector(".btn.primary") || card.querySelector("button"))?.focus();
+  (card.querySelector(".btn.primary:not(:disabled)") || card.querySelector("button:not(:disabled)"))?.focus();
+}
+// 같은 창이 열려 있으면 내용만 바꾼다 (포커스·입력값 유지), 아니면 새로 연다
+function showScreen(screen, html) {
+  if (modalScreen !== screen || $("modal").hidden) { openModal(html, screen); return; }
+  const focused = document.activeElement?.id;
+  $("modal-card").innerHTML = html;
+  if (focused) $(focused)?.focus();
 }
 const closeModal = () => {
   $("modal").hidden = true;
+  modalScreen = "";
   turnAt = performance.now(); // 창 버튼을 두 번 눌러도 뒤의 내 차례 버튼이 눌리지 않게
 };
 
 function setupHtml(resume) {
+  const tabs = `
+    <div class="seg tabs" role="group" aria-label="게임 방식">
+      <button type="button" id="tab-solo" aria-pressed="${setup.tab !== "mp"}">혼자 하기</button>
+      <button type="button" id="tab-mp" aria-pressed="${setup.tab === "mp"}">친구와 하기</button>
+    </div>`;
+  return tabs + (setup.tab === "mp" ? netMenuHtml() : soloSetupHtml(resume));
+}
+
+function soloSetupHtml(resume) {
   const n = setup.n;
   const counts = [2, 3, 4, 5, 6].map((k) =>
     `<button type="button" data-count="${k}" aria-pressed="${k === n}">${k}명</button>`).join("");
@@ -942,18 +1125,38 @@ function standingsHtml() {
   const rows = S.m.players.map((p, s) => ({ s, p }));
   const alive = rows.filter((r) => !r.p.place).sort((a, b) => b.p.stack - a.p.stack);
   const placed = rows.filter((r) => r.p.place).sort((a, b) => a.p.place - b.p.place);
-  return `<ol class="standings">${[...alive, ...placed].map(({ s, p }) =>
-    `<li class="${s === YOU ? "me" : ""}"><span class="avatar" style="--av:${ROSTER[s].color}" aria-hidden="true">${ROSTER[s].initial}</span><b>${esc(nm(s))}</b><span>${p.place ? `${p.place}위` : `${fmt(p.stack)} 칩`}</span></li>`).join("")}</ol>`;
+  return `<ol class="standings">${[...alive, ...placed].map(({ s, p }) => {
+    const r = seatLook(s);
+    return `<li class="${s === ME ? "me" : ""}"><span class="avatar" style="--av:${r.color}" aria-hidden="true">${esc(r.initial)}</span><b>${esc(nm(s))}</b><span>${p.place ? `${p.place}위` : `${fmt(p.stack)} 칩`}</span></li>`;
+  }).join("")}</ol>`;
 }
 
 function endHtml() {
-  const m = S.m, n = m.players.length, me = m.players[YOU], st = S.stats;
-  const vpip = st.hands ? Math.round((100 * st.vpip) / st.hands) : 0;
+  const m = S.m, n = m.players.length, me = m.players[ME], st = S.stats;
   let eyebrow, title;
   if (me.place === 1) { eyebrow = `${m.handNo}핸드 만에 우승`; title = `우승 · ${n}명 중 1위`; }
   else if (m.over && S.watched) { eyebrow = `${m.handNo}핸드 만에 끝`; title = `최종 결과 · 나는 ${n}명 중 ${me.place}위`; }
+  else if (m.over && me.place === 0) { eyebrow = `${m.handNo}핸드 만에 끝`; title = "최종 결과"; }
   else { eyebrow = `${m.handNo}핸드 만에 탈락`; title = `탈락 · ${n}명 중 ${me.place}위`; }
   const watch = !m.over ? `<button class="btn" id="m-watch" type="button">계속 지켜보기</button>` : `<button class="btn" id="m-close" type="button">테이블 보기</button>`;
+  if (mode !== "solo") {
+    const code = mode === "host" ? room.code : guest.code;
+    const actions = mode === "host"
+      ? `${m.over ? `<button class="btn primary" id="m-again" type="button">다시 하기 · 같은 방</button>` : ""}${watch}<button class="btn" id="mp-close" type="button">방 닫기</button>`
+      : `${watch}<button class="btn" id="mp-leave" type="button">나가기</button>`;
+    return `
+      <p class="eyebrow">${eyebrow}</p>
+      <h1>${title}</h1>
+      <dl class="rules">
+        <div><dt>가장 큰 팟</dt><dd>${fmt(S.biggestPot)}</dd></div>
+        <div><dt>마지막 블라인드</dt><dd>${m.hand.sb}/${m.hand.bb}</dd></div>
+        <div><dt>방</dt><dd>${esc(code)} · ${n}명</dd></div>
+      </dl>
+      ${standingsHtml()}
+      ${mode === "guest" && m.over ? `<p class="fine standings-note">방장이 ‘다시 하기’를 누르면 같은 자리로 새 게임이 시작돼요.</p>` : ""}
+      <div class="modal-actions">${actions}</div>`;
+  }
+  const vpip = st.hands ? Math.round((100 * st.vpip) / st.hands) : 0;
   return `
     <p class="eyebrow">${eyebrow}</p>
     <h1>${title}</h1>
@@ -979,7 +1182,8 @@ function openSetup(resume) {
   if (S) stopAll();
   setup.n = S ? S.m.players.length : setup.n;
   setup.claude = S ? S.claudeOn : setup.claude;
-  openModal(setupHtml(resume));
+  setup.resume = resume;
+  openModal(setupHtml(resume), "setup");
 }
 
 // 설정 창을 닫고 지금 매치로 돌아간다
@@ -990,24 +1194,698 @@ function resumeMatch() {
   advance();
 }
 
+// ===== 친구와 하기: 첫 화면 =====
+function loadProfile() {
+  let p = null;
+  try { p = JSON.parse(localStorage.getItem(NET_KEY)); } catch {}
+  if (!p || typeof p !== "object") p = {};
+  const ok = typeof PokerNet === "object";
+  const token = typeof p.token === "string" && /^[A-Za-z0-9_-]{8,48}$/.test(p.token) ? p.token : ok ? PokerNet.newToken() : "";
+  const last = p.last && typeof p.last.code === "string" && Number.isFinite(p.last.at) ? { code: p.last.code, at: p.last.at } : null;
+  return { name: ok ? PokerNet.cleanName(p.name) : "", token, last };
+}
+function saveProfile() {
+  try { localStorage.setItem(NET_KEY, JSON.stringify(profile)); } catch {}
+}
+
+// 주소의 #join-코드 (참가 링크)
+function hashCode() {
+  const m = /^#join-([A-Za-z0-9]{5})$/.exec(location.hash);
+  return m && typeof PokerNet === "object" ? PokerNet.normCode(m[1]) : null;
+}
+function setHash(code) {
+  try { history.replaceState(null, "", code ? `#join-${code}` : location.pathname + location.search); } catch {}
+}
+// 참가 링크: 지금 주소에서 만든다 (GitHub Pages면 https://swlee3286.github.io/holdem/#join-코드, 로컬도 그대로)
+const shareUrl = (code) => location.href.split("#")[0].replace(/index\.html$/, "") + "#join-" + code;
+
+function netMenuHtml() {
+  if (!netOk() && !window.claude) {
+    return `
+      <p class="eyebrow">각자 폰으로 · 온라인</p>
+      <h1>친구와 한 테이블</h1>
+      <p>이 브라우저에서는 온라인 연결(WebRTC)을 쓸 수 없어요. 최신 Chrome · Safari · 삼성 인터넷에서 열어 주세요.</p>
+      <p class="url-line">${esc(PUBLIC_URL)}</p>`;
+  }
+  if (!netOk()) {
+    return `
+      <p class="eyebrow">각자 폰으로 · 온라인</p>
+      <h1>친구와 한 테이블</h1>
+      <p>친구와 하기는 이 화면에서는 쓸 수 없어요. Claude 아티팩트 안에서는 외부 연결이 막혀 있거든요.</p>
+      <p>아래 GitHub 주소로 열면 친구들이 각자 폰으로 들어와 같이 할 수 있어요.</p>
+      <p class="url-line">${esc(PUBLIC_URL)}</p>
+      <p class="fine">혼자 하기(Claude와 AI 상대)는 여기서 그대로 할 수 있어요.</p>`;
+  }
+  const err = setup.err ? `<p class="net-error" role="alert">${esc(setup.err)}</p>` : "";
+  const nameField = `
+    <label class="field-col">
+      <span class="field-label">내 이름</span>
+      <input class="text-in" id="mp-name" maxlength="10" autocomplete="nickname" enterkeyhint="go" placeholder="10자까지" value="${esc(setup.name)}">
+    </label>`;
+  // 참가 링크로 들어온 친구: 이름만 적고 바로 참가
+  const linked = setup.link && PokerNet.normCode(setup.code);
+  if (linked) {
+    return `
+      <p class="eyebrow">친구와 하기 · 초대</p>
+      <h1>방 <span class="code-text">${esc(linked)}</span>에 참가</h1>
+      ${nameField}
+      <input type="hidden" id="mp-code" value="${esc(linked)}">
+      ${err}
+      <div class="modal-actions"><button class="btn primary" id="mp-join" type="button">참가하기</button></div>
+      <p class="fine invite-note">이름만 적으면 바로 들어가요. 방장이 시작하면 카드가 나와요. 같은 와이파이가 아니어도 돼요.</p>
+      <button class="link-btn" id="mp-other" type="button">다른 코드 입력 · 방 만들기</button>`;
+  }
+  return `
+    <p class="eyebrow">각자 폰으로 · 온라인</p>
+    <h1>친구와 한 테이블</h1>
+    <label class="field-col">
+      <span class="field-label">내 이름</span>
+      <input class="text-in" id="mp-name" maxlength="10" autocomplete="nickname" enterkeyhint="done" placeholder="10자까지" value="${esc(setup.name)}">
+    </label>
+    <div class="mp-choice">
+      <section class="mp-box">
+        <h2>방 만들기</h2>
+        <p>내 기기가 딜러가 돼요. 코드나 링크를 친구에게 보내세요.</p>
+        <button class="btn primary" id="mp-host" type="button">방 만들기</button>
+      </section>
+      <section class="mp-box">
+        <h2>참가하기</h2>
+        <p>친구에게 받은 코드 5자리</p>
+        <div class="join-row">
+          <input class="text-in code-in" id="mp-code" maxlength="7" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="go" placeholder="ABCDE" aria-label="방 코드" value="${esc(setup.code)}">
+          <button class="btn${setup.code ? " primary" : ""}" id="mp-join" type="button">참가</button>
+        </div>
+      </section>
+    </div>
+    ${err}
+    <p class="fine">같은 와이파이가 아니어도 돼요. 빈 자리는 AI가 앉아요. 일부 회사·학교 와이파이나 모바일 데이터에서는 연결이 막힐 수 있어요.</p>`;
+}
+
+function readSetupInputs() {
+  const n = $("mp-name"), c = $("mp-code");
+  if (n) setup.name = n.value;
+  if (c) setup.code = c.value;
+}
+
+function setupError(msg, focusId) {
+  setup.err = msg;
+  openModal(setupHtml(setup.resume), "setup");
+  if (focusId) $(focusId)?.focus();
+}
+
+// 혼자 하기 화면에서 나간다 (혼자 하기 매치는 저장돼 있어 처음으로 돌아오면 이어할 수 있다)
+function leaveSolo() {
+  stopAll();
+  S = null;
+  tableKey = controlsKey = logKey = turnKey = "";
+  hint = { key: "", d: null };
+}
+
+// 친구와 하기를 끝내고 첫 화면으로
+function backToStart(err = "") {
+  stopAll();
+  clearInterval(tickTimer);
+  clearTimeout(pendTimer);
+  clearTimeout(retryTimer);
+  releaseWake();
+  if (net) { try { net.close(mode === "host" ? "closed" : undefined); } catch {} }
+  net = null;
+  mode = "solo";
+  ME = 0;
+  room = null;
+  guest = null;
+  setHash(null);
+  S = load();
+  tableKey = controlsKey = logKey = turnKey = "";
+  hint = { key: "", d: null };
+  setup.tab = "mp";
+  setup.err = err;
+  setup.resume = true;
+  if (S) {
+    setup.n = S.m.players.length;
+    setup.claude = S.claudeOn;
+    render();
+  } else {
+    $("log").innerHTML = "";
+    $("controls").innerHTML = `<div class="waiting">인원을 고르면 카드를 나눠줍니다</div>`;
+    renderPreview(setup.n);
+  }
+  openModal(setupHtml(true), "setup");
+  renderTop();
+}
+
+// 화면이 꺼지지 않게 (지원하는 브라우저만)
+async function requestWake() {
+  try {
+    if (!wakeLock && navigator.wakeLock && document.visibilityState === "visible") {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener?.("release", () => { wakeLock = null; });
+    }
+  } catch { wakeLock = null; }
+}
+function releaseWake() {
+  try { wakeLock?.release(); } catch {}
+  wakeLock = null;
+}
+
+function toast(text) {
+  let el = $("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.className = "toast";
+    el.setAttribute("role", "status");
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add("on");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("on"), 3500);
+}
+
+function lobbyRows(list, mine) {
+  return list.map((p) => {
+    const r = ROSTER[p.seat] ?? ROSTER[0];
+    const initial = p.kind === "ai" && p.name === r.name ? r.initial : Array.from(p.name)[0] || "?";
+    const tag = p.isHost ? "방장" : p.kind === "ai" ? "AI" : p.connected ? "들어옴" : "연결 끊김";
+    return `<li class="${p.seat === mine ? "me" : ""}${p.kind === "ai" ? " ai" : ""}${p.connected ? "" : " away"}"><span class="avatar" style="--av:${r.color}" aria-hidden="true">${esc(initial)}</span><b>${esc(p.name)}</b>${p.seat === mine ? `<small>나</small>` : ""}<span class="lob-tag">${tag}</span></li>`;
+  }).join("");
+}
+
+// ===== 친구와 하기: 방장 =====
+function hostCreate() {
+  readSetupInputs();
+  const name = PokerNet.cleanName(setup.name);
+  if (!name) { setupError("이름을 적어 주세요", "mp-name"); return; }
+  setup.err = "";
+  profile.name = name;
+  saveProfile();
+  hostOpen(null, name);
+}
+
+// saved: 새로고침 전에 저장한 방 (없으면 새 방)
+function hostOpen(saved, hostName) {
+  leaveSolo();
+  mode = "host";
+  ME = 0;
+  if (saved) {
+    room = saved.room;
+    S = saved.S;
+    if (S) { S.turn = null; S.nextAt = 0; }
+  } else {
+    room = { code: "", n: setup.mpN, hostName: PokerNet.cleanName(hostName, "방장"), started: false, guests: [], peerToken: PokerNet.newToken(24) };
+    S = null;
+  }
+  Object.assign(room, { ready: false, status: "checking", note: "", error: "" });
+  startTicker();
+  requestWake();
+  hostConnect(!!saved);
+  if (S && room.started) {
+    render();
+    openModal(`
+      <p class="eyebrow">친구와 하기 · 방장</p>
+      <h1>방 ${esc(room.code)} 다시 여는 중…</h1>
+      <p>새로고침 전에 하던 게임(핸드 #${S.m.handNo})을 이어서 열어요. 친구들은 자동으로 다시 들어와요.</p>
+      <p class="net-error" id="resume-error" role="alert" hidden></p>
+      <div class="modal-actions"><button class="btn" id="mp-close" type="button">방 닫기</button></div>`, "resume");
+  } else {
+    renderPreview(room.n);
+    showHostLobby();
+  }
+  renderTop();
+}
+
+function hostConnect(resume) {
+  if (net) net.close("left");
+  net = PokerNet.createHost({ kind: NET_KIND, code: room.code || undefined, peerToken: room.peerToken, resume: resume || !!room.code, params: QS }, {
+    onReady(code) {
+      room.code = code;
+      room.ready = true;
+      room.error = "";
+      room.status = "online";
+      saveRoom();
+      if (S && room.started) {
+        if (modalScreen === "resume") closeModal();
+        tableKey = controlsKey = "";
+        advance(); // 멈춰 있던 차례 · 타이머를 다시 시작한다
+      } else showHostLobby();
+      renderTop();
+    },
+    onHello: hostHello,
+    onAct: hostAct,
+    onLeave: hostLeave,
+    onError: hostNetError,
+    onStatus(st) {
+      room.status = st;
+      renderTop();
+    },
+  });
+}
+
+function hostNetError(code) {
+  let msg;
+  if (code === "id-taken") msg = room.code ? `방 코드 ${room.code}를 다시 열 수 없어요. 방을 닫고 새로 만들어 주세요.` : "방 코드를 만들지 못했어요. 잠시 뒤 다시 해 주세요.";
+  else if (code === "unsupported") msg = "이 브라우저는 온라인 연결(WebRTC)을 지원하지 않아요.";
+  else msg = "연결 서버에 닿지 않아요. 인터넷 연결을 확인해 주세요. 계속 다시 시도해요.";
+  room.error = msg;
+  room.status = "offline";
+  // 서버에 못 닿았으면 같은 코드로 잠시 뒤 다시 연다
+  if (code === "network" && mode === "host") {
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(() => { if (mode === "host" && room && !room.ready) hostConnect(true); }, 4000);
+  }
+  if (modalScreen === "resume") {
+    const el = $("resume-error");
+    if (el) { el.textContent = msg; el.hidden = false; }
+  } else if (!room.started) showHostLobby();
+  else toast(msg);
+  renderTop();
+}
+
+// AI 자리 이름: 자리별 기본 이름을 쓰되, 사람 이름과 겹치면 다른 이름으로.
+// 친구와 하기에서는 Claude를 부르지 않으므로(모든 AI = GTO 엔진) 1번 자리도 'Claude'라 부르지 않는다
+const AI_POOL = ["민지", "준호", "서윤", "태현", "하준", "지우", "도윤", "예린", "시우", "하린"];
+function aiSeatNames() {
+  const taken = [room.hostName, ...room.guests.map((g) => g.name)], out = {};
+  for (let s = 1; s < room.n; s++) {
+    if (PokerNet.roomGuestAt(room, s)) continue;
+    const pref = s === CLAUDE ? null : ROSTER[s].name;
+    const name = pref && !taken.includes(pref) ? pref : AI_POOL.find((x) => !taken.includes(x)) ?? `AI ${s}`;
+    taken.push(name);
+    out[s] = name;
+  }
+  return out;
+}
+
+function hostLobbyPlayers() {
+  const list = [{ seat: 0, name: room.hostName, kind: "human", connected: true, isHost: true }];
+  if (room.started && S) {
+    S.m.players.forEach((p, s) => { if (s) list.push({ seat: s, name: p.name, kind: p.kind === "bot" ? "ai" : "human", connected: seatOnline(s), isHost: false }); });
+    return list;
+  }
+  for (const g of room.guests) list.push({ seat: g.seat, name: g.name, kind: "human", connected: g.connected, isHost: false });
+  const ai = aiSeatNames();
+  for (let s = room.guests.length + 1; s < room.n; s++) list.push({ seat: s, name: ai[s], kind: "ai", connected: true, isHost: false });
+  return list;
+}
+
+function hostLobbyHtml() {
+  const r = room, n = r.n, joined = r.guests.length;
+  const can = r.ready && r.guests.some((g) => g.connected);
+  const counts = [2, 3, 4, 5, 6].map((k) =>
+    `<button type="button" data-mpn="${k}" aria-pressed="${k === n}" ${k < joined + 1 ? "disabled" : ""}>${k}명</button>`).join("");
+  const url = r.ready ? shareUrl(r.code) : "";
+  return `
+    <p class="eyebrow">친구와 하기 · 방장</p>
+    <h1>${joined ? "친구가 들어왔어요" : "친구를 기다리는 중"}</h1>
+    <div class="room-code-box">
+      <span class="field-label">방 코드</span>
+      <div class="room-code${r.ready ? "" : " pending"}" id="room-code" aria-live="polite">${r.ready ? esc(r.code) : "여는 중…"}</div>
+    </div>
+    <div class="share-row">
+      <input class="text-in share-url" id="mp-url" readonly value="${esc(url)}" placeholder="링크 만드는 중…" aria-label="참가 링크">
+      <button class="btn primary" id="mp-share" type="button" ${r.ready ? "" : "disabled"}>${navigator.share ? "공유" : "링크 복사"}</button>
+    </div>
+    <p class="fine share-note" id="share-note">${esc(r.note || "링크를 보내거나 코드를 알려 주세요. 친구는 링크를 열고 이름만 적으면 돼요.")}</p>
+    ${r.error ? `<p class="net-error" role="alert">${esc(r.error)}</p>` : ""}
+    <div class="field">
+      <span class="field-label" id="mpn-label">인원</span>
+      <div class="seg count" role="group" aria-labelledby="mpn-label">${counts}</div>
+    </div>
+    <ul class="lobby">${lobbyRows(hostLobbyPlayers(), 0)}</ul>
+    <div class="modal-actions">
+      <button class="btn primary" id="mp-start" type="button" ${can ? "" : "disabled"}>${can ? `${n}명으로 시작` : "친구가 들어오면 시작"}</button>
+      <button class="btn" id="mp-close" type="button">방 닫기</button>
+    </div>
+    <p class="fine">빈 자리는 AI(GTO 엔진)가 앉아요. 내 기기가 딜러라서 게임이 끝날 때까지 이 화면을 켜 두세요.</p>`;
+}
+
+function showHostLobby() {
+  if (mode !== "host" || room.started) return;
+  showScreen("lobby", hostLobbyHtml());
+}
+
+function hostHello(id, msg) {
+  if (msg.v !== PokerNet.V) { net.drop(id, { t: "error", msg: "게임 버전이 달라요. 페이지를 새로고침해 주세요", fatal: true }); return; }
+  const r = PokerNet.roomJoin(room, msg, id); // 이름이 겹치면 숫자를 붙인다 (AI 이름은 시작할 때 피해 간다)
+  if (!r.ok) { net.drop(id, { t: "error", msg: r.msg, fatal: true }); return; }
+  if (r.replaced) net.drop(r.replaced, { t: "error", msg: "다른 곳에서 이 자리로 다시 들어왔어요", fatal: true });
+  net.send(id, { t: "welcome", seat: r.seat });
+  saveRoom();
+  lobbyBroadcast();
+  if (room.started && S) {
+    if (r.back) toast(`${S.m.players[r.seat].name} 다시 연결됨`);
+    advance(); // 되찾은 자리: 바로 그 사람 화면을 보내고, 그 자리 차례면 사람을 기다린다
+  } else showHostLobby();
+  renderTop();
+}
+
+function hostAct(id, msg) {
+  const g = room.guests.find((x) => x.conn === id);
+  if (!g || !room.started || !S || !room.ready) return;
+  const r = PokerNet.checkAct(S.m, g.seat, msg);
+  if (!r.ok) { sendState(g); return; } // 늦었거나 차례가 아니거나 규칙에 맞지 않는 수는 무시하고 지금 화면을 다시 보낸다
+  doAct(g.seat, r.type, r.to);
+}
+
+function hostLeave(id) {
+  const seat = PokerNet.roomLeave(room, id);
+  if (seat < 0) return;
+  saveRoom();
+  lobbyBroadcast();
+  if (room.started && S) {
+    toast(`${S.m.players[seat].name} 연결 끊김 · AI가 대신 둡니다`);
+    advance(); // 그 자리 차례였다면 AI가 대신
+  } else showHostLobby();
+  renderTop();
+}
+
+function lobbyBroadcast() {
+  if (!net || !room.code) return;
+  const players = hostLobbyPlayers();
+  for (const g of room.guests) {
+    if (g.conn && g.connected) net.send(g.conn, { t: "lobby", code: room.code, players, seats: room.n, started: room.started, you: g.seat });
+  }
+}
+
+function hostStart() {
+  if (!room.ready || room.started || !room.guests.some((g) => g.connected)) return;
+  room.started = true;
+  closeModal();
+  newMatchMP();
+  lobbyBroadcast();
+}
+
+// 같은 방 · 같은 자리로 새 매치 (처음 시작 · 다시 하기)
+function newMatchMP() {
+  stopAll();
+  const players = [], ai = aiSeatNames();
+  for (let s = 0; s < room.n; s++) {
+    const g = PokerNet.roomGuestAt(room, s);
+    players.push(s === 0 ? { name: room.hostName, kind: "human" } : g ? { name: g.name, kind: "remote" } : { name: ai[s], kind: "bot" });
+  }
+  S = {
+    v: 2,
+    m: PT.createMatch({ players, startStack: START_STACK, levels: LEVELS, handsPerLevel: HANDS_PER_LEVEL }),
+    claudeOn: false, depth: "quick",
+    stats: { hands: 0, vpip: 0, pfr: 0, aggr: 0, calls: 0, facedBet: 0, foldedToBet: 0, showdowns: [] },
+    history: [], log: [], logAt: null, say: null, track: null, biggestPot: 0, doneNo: 0, ended: "", watched: false,
+    matchId: PokerNet.newToken(10), // 손님이 새 매치를 알아보는 표시
+    turn: null,                     // 사람 차례 제한 시간 { key, seat, deadline }
+    nextAt: 0,                      // 다음 핸드 자동 시작 시각
+  };
+  fast = false;
+  tableKey = controlsKey = logKey = turnKey = "";
+  requestWake();
+  startHand();
+}
+
+// 방장: 다음에 일어날 일을 예약한다 (카드 펼치기 · AI 차례 · 사람 차례 제한 시간 · 다음 핸드)
+function hostSchedule() {
+  const m = S.m, h = m.hand;
+  clearTimeout(timer);
+  clearTimeout(turnTimer);
+  clearTimeout(nextTimer);
+  if (h.phase === "runout") {
+    S.turn = null;
+    timer = setTimeout(() => {
+      if (!S || S.m !== m || m.hand !== h || h.phase !== "runout") return;
+      PT.runoutStep(m);
+      advance();
+    }, 900);
+  } else if (h.phase === "bet") {
+    const seat = h.toAct, p = m.players[seat];
+    if (p.kind === "human" || (p.kind === "remote" && seatOnline(seat))) {
+      const key = `${h.no}|${h.actions.length}|${seat}`;
+      if (S.turn?.key !== key) S.turn = { key, seat, deadline: Date.now() + TURN_MS };
+      turnTimer = setTimeout(() => turnTimeout(m, h, seat), Math.max(0, S.turn.deadline - Date.now()));
+    } else {
+      S.turn = null;
+      timer = setTimeout(() => botTurn(m, h, seat), 450 + Math.random() * 450);
+    }
+  } else {
+    S.turn = null;
+    if (!m.over) {
+      if (!S.nextAt) S.nextAt = Date.now() + NEXT_MS;
+      nextTimer = setTimeout(() => { if (S && S.m === m && m.hand === h) startHand(); }, Math.max(0, S.nextAt - Date.now()));
+    }
+  }
+}
+
+// 시간 초과: 체크할 수 있으면 체크, 아니면 폴드
+function turnTimeout(m, h, seat) {
+  if (!S || S.m !== m || m.hand !== h || h.phase !== "bet" || h.toAct !== seat) return;
+  const L = PT.legal(m, seat);
+  doAct(seat, L.toCall === 0 ? "check" : "fold", undefined, "", "timeout");
+}
+
+function viewExtra() {
+  const now = Date.now();
+  return {
+    match: S.matchId, code: room.code,
+    connected: S.m.players.map((_, s) => seatOnline(s)),
+    turn: S.turn ? { seat: S.turn.seat, left: S.turn.deadline - now, total: TURN_MS } : null,
+    next: S.nextAt ? S.nextAt - now : null,
+  };
+}
+
+function sendState(g) {
+  if (!net || !g.conn || !S) return;
+  net.send(g.conn, { t: "state", view: PokerNet.viewFor(S.m, g.seat, viewExtra()) });
+}
+
+function hostBroadcast() {
+  if (!room?.ready || !room.started || !S) return;
+  for (const g of room.guests) if (g.conn && g.connected) sendState(g);
+}
+
+function saveRoom() {
+  if (mode !== "host" || !room?.code) return;
+  const data = {
+    v: 1, at: Date.now(),
+    room: { code: room.code, n: room.n, hostName: room.hostName, started: room.started, peerToken: room.peerToken, guests: room.guests.map((g) => ({ seat: g.seat, name: g.name, token: g.token })) },
+    S: room.started ? S : null,
+  };
+  try { localStorage.setItem(ROOM_KEY, JSON.stringify(data)); } catch {}
+}
+
+function loadRoom() {
+  try {
+    const d = JSON.parse(localStorage.getItem(ROOM_KEY));
+    if (!d || d.v !== 1 || !d.room || !Number.isFinite(d.at) || Date.now() - d.at > RESUME_MS) return null;
+    const r = d.room;
+    if (!PokerNet.normCode(r.code) || !(r.n >= 2 && r.n <= 6) || !Array.isArray(r.guests) || typeof r.peerToken !== "string") return null;
+    const S0 = r.started ? d.S : null;
+    if (r.started && (!S0?.m?.hand || S0.m.players.length !== r.n || !S0.matchId || !S0.logAt)) return null;
+    return {
+      // 시작 전 로비는 손님 목록을 비운다 (다시 들어오면 새로 앉는다)
+      room: { code: r.code, n: r.n, hostName: PokerNet.cleanName(r.hostName, "방장"), started: !!r.started, peerToken: r.peerToken,
+        guests: r.started ? r.guests.map((g) => ({ seat: g.seat, name: g.name, token: g.token, conn: null, connected: false })) : [] },
+      S: S0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function hostClose() {
+  setup.link = false;
+  try { localStorage.removeItem(ROOM_KEY); } catch {}
+  backToStart();
+}
+
+// ===== 친구와 하기: 손님 =====
+function guestJoinFromForm() {
+  readSetupInputs();
+  const code = PokerNet.normCode(setup.code);
+  const name = PokerNet.cleanName(setup.name);
+  if (!name) { setupError("이름을 적어 주세요", "mp-name"); return; }
+  if (!code) { setupError("방 코드 5자리를 확인해 주세요", "mp-code"); return; }
+  setup.err = "";
+  profile.name = name;
+  saveProfile();
+  guestJoin(code, name, false);
+}
+
+// persistent: 새로고침 뒤 다시 들어가는 중 (방이 잠깐 안 보여도 계속 시도)
+function guestJoin(code, name, persistent) {
+  leaveSolo();
+  mode = "guest";
+  ME = 0;
+  guest = { code, name, seat: -1, status: "connecting", lobby: null, view: null, at: 0, pending: null, gone: "" };
+  profile.last = { code, at: Date.now() };
+  saveProfile();
+  setHash(code);
+  startTicker();
+  net = PokerNet.createClient({ kind: NET_KIND, code, name, token: profile.token, persistent, params: QS }, {
+    onWelcome(seat) {
+      guest.seat = seat;
+      if (!S) guestScreen();
+    },
+    onLobby(msg) {
+      const resize = !guest.lobby || guest.lobby.seats !== msg.seats;
+      guest.lobby = msg;
+      if (S) { renderTop(); return; }
+      if (resize) renderPreview(msg.seats); // 뒤에 보이는 빈 테이블도 방 인원으로
+      guestScreen();
+    },
+    onState: guestState,
+    onError(msg, fatal) {
+      if (fatal) guestStop(msg);
+      else toast(msg);
+    },
+    onBye(reason) {
+      if (reason === "closed") guestStop("방장이 방을 닫았어요", true);
+      else { guest.gone = "left"; showHostLeft(); }
+    },
+    onStatus(st) {
+      guest.status = st;
+      renderTop();
+      if (!S) guestScreen();
+      else if (st === "reconnecting") { controlsKey = ""; render(); }
+    },
+    onFatal(code) {
+      guestStop({
+        "not-found": "방을 찾을 수 없어요. 코드를 확인해 주세요. 방장이 방을 닫았을 수도 있어요.",
+        timeout: "연결하지 못했어요. 와이파이나 모바일 데이터를 바꿔 다시 해 보세요. 일부 네트워크에서는 연결이 막혀 있어요.",
+        network: "연결 서버에 닿지 않아요. 인터넷 연결을 확인해 주세요.",
+        unsupported: "이 브라우저는 온라인 연결(WebRTC)을 지원하지 않아요.",
+        gone: "방장과 연결이 끊겼어요. 방장이 돌아오지 않았어요.",
+      }[code] || "연결이 끊겼어요.", !!S);
+    },
+  });
+  guestScreen();
+  renderTop();
+}
+
+function guestWaitHtml() {
+  const g = guest, lob = g.lobby;
+  const title = g.status === "reconnecting" ? "다시 연결하는 중…" : !lob ? "방에 들어가는 중…" : lob.started ? "게임에 들어가는 중…" : "방장이 시작하기를 기다리는 중";
+  return `
+    <p class="eyebrow">친구와 하기 · 방 ${esc(g.code)}</p>
+    <h1>${title}</h1>
+    ${lob ? `<ul class="lobby">${lobbyRows(lob.players, lob.you)}</ul>
+      <p class="fine">${lob.seats}명 테이블 · 빈 자리는 AI가 앉아요. 시작하면 바로 카드가 나와요.</p>`
+      : `<p class="fine">${esc(g.code)} 방에 연결하고 있어요. 같은 와이파이가 아니어도 돼요.</p>`}
+    <div class="modal-actions"><button class="btn" id="mp-leave" type="button">나가기</button></div>`;
+}
+
+function guestScreen() {
+  if (mode !== "guest" || S) return;
+  showScreen("wait", guestWaitHtml());
+}
+
+function guestState(view) {
+  if (mode !== "guest" || !view.hand) return;
+  guest.view = view;
+  guest.at = performance.now();
+  guest.status = "open";
+  if (guest.pending) { guest.pending = null; clearTimeout(pendTimer); }
+  if (guest.gone) { guest.gone = ""; if (modalScreen === "left") closeModal(); }
+  if (Date.now() - profile.last?.at > 30000) { profile.last = { code: guest.code, at: Date.now() }; saveProfile(); }
+  if (!S || S.matchId !== view.match) { // 첫 화면 · 새 매치(다시 하기)
+    S = { v: 2, m: null, claudeOn: false, stats: null, history: [], log: [], logAt: null, say: null, biggestPot: 0, doneNo: 0, ended: "", watched: false, matchId: view.match };
+    tableKey = controlsKey = logKey = turnKey = "";
+    if (["wait", "end", "left"].includes(modalScreen)) closeModal();
+    requestWake();
+  }
+  ME = view.seat;
+  const prevNo = S.m?.hand?.no;
+  S.m = PokerNet.viewToMatch(view);
+  const h = S.m.hand;
+  if (h.no !== prevNo) beginLog(h);
+  syncLog();
+  if (h.phase === "done") {
+    handDone(h);
+    if (needsEndModal()) {
+      clearTimeout(endTimer);
+      endTimer = setTimeout(showEnd, 1600);
+    }
+  }
+  render();
+}
+
+// 손님의 수: 방장에게 보내고, 새 화면이 올 때까지 버튼을 잠근다
+function guestSend(h, L, type, to) {
+  if (guest.pending) return;
+  if (!net?.open) { toast("연결이 끊겨 있어요. 다시 연결하는 중…"); return; }
+  const msg = { t: "act", hand: h.no, n: h.actions.length, type };
+  if (type === "raise") msg.to = clamp(Math.round(Number(to)) || L.minTo, L.minTo, L.maxTo);
+  guest.pending = { no: h.no, n: h.actions.length };
+  net.send(msg);
+  controlsKey = "";
+  renderControls();
+  clearTimeout(pendTimer);
+  pendTimer = setTimeout(() => { // 답이 없으면 다시 누를 수 있게
+    if (!guest?.pending) return;
+    guest.pending = null;
+    controlsKey = "";
+    if (S) renderControls();
+  }, 6000);
+}
+
+function showHostLeft() {
+  if (!S) { guestScreen(); return; }
+  openModal(`
+    <p class="eyebrow">친구와 하기 · 방 ${esc(guest.code)}</p>
+    <h1>방장이 나갔어요</h1>
+    <p>방장이 다시 들어오면 자동으로 이어져요. 기다리지 않으려면 처음으로 돌아가세요.</p>
+    <div class="modal-actions"><button class="btn primary" id="mp-home" type="button">처음으로</button></div>`, "left");
+}
+
+// 손님 연결을 끝낸다. 게임 화면이 있으면 그 위에 알림, 없으면 첫 화면에 오류로
+function guestStop(msg, overTable) {
+  if (net) { try { net.close(); } catch {} }
+  net = null;
+  profile.last = null;
+  saveProfile();
+  if (overTable && S) {
+    clearInterval(tickTimer);
+    releaseWake();
+    guest.status = "closed";
+    openModal(`
+      <p class="eyebrow">친구와 하기 · 방 ${esc(guest.code)}</p>
+      <h1>${esc(msg)}</h1>
+      <div class="modal-actions"><button class="btn primary" id="mp-home" type="button">처음으로</button></div>`, "ended");
+    return;
+  }
+  backToStart(msg);
+}
+
+function guestLeave() {
+  setup.link = false;
+  profile.last = null;
+  saveProfile();
+  backToStart();
+}
+
+const leaveConfirmHtml = () => mode === "host" ? `
+  <h1>방을 닫을까요?</h1>
+  <p>내 기기가 딜러라서 방을 닫으면 친구들의 게임도 끝나요.</p>
+  <div class="modal-actions"><button class="btn primary" id="mp-close" type="button">방 닫기</button><button class="btn" id="m-close" type="button">계속하기</button></div>` : `
+  <h1>방에서 나갈까요?</h1>
+  <p>내 자리는 AI가 대신 둡니다. 같은 링크로 다시 들어오면 자리를 되찾아요.</p>
+  <div class="modal-actions"><button class="btn primary" id="mp-leave" type="button">나가기</button><button class="btn" id="m-close" type="button">계속하기</button></div>`;
+
 // ===== 입력 =====
 document.addEventListener("click", (e) => {
   const t = e.target.closest("button");
   if (!t) return;
-  const h = S?.m.hand;
+  const h = S?.m?.hand;
   switch (t.id) {
     case "m-start": closeModal(); newMatch(setup.n, setup.claude); return;
     case "m-resume": case "m-cancel": resumeMatch(); return;
-    case "m-again": closeModal(); newMatch(S.m.players.length, S.claudeOn); return;
+    case "m-again": closeModal(); if (mode === "host") newMatchMP(); else newMatch(S.m.players.length, S.claudeOn); return;
     case "m-setup": openSetup(false); return;
     case "m-watch": S.watched = true; save(); closeModal(); if (!thinking) advance(); return;
     case "m-close": closeModal(); if (S && !thinking) advance(); return;
     case "new-game":
-      if (S && !S.m.over) { stopAll(); render(); openModal(confirmNewHtml()); } // 묻는 동안 게임을 멈춘다 (계속하기 → 이어서)
+      if (mode !== "solo") openModal(leaveConfirmHtml(), "leave"); // 친구와 하기는 멈추지 않는다
+      else if (S && !S.m.over) { stopAll(); render(); openModal(confirmNewHtml()); } // 묻는 동안 게임을 멈춘다 (계속하기 → 이어서)
       else openSetup(false);
       return;
-    case "next": startHand(); return;
-    case "show-end": clearTimeout(endTimer); if (S.ended && S.m.over) openModal(endHtml()); else showEnd(); return;
+    case "next": if (mode !== "guest") startHand(); return;
+    case "show-end": clearTimeout(endTimer); if (S.ended && S.m.over) openModal(endHtml(), "end"); else showEnd(); return;
     case "fast": fast = !fast; controlsKey = ""; if (h?.phase !== "done" && !thinking) advance(); else render(); return;
     case "hint-toggle":
       hintOn = !hintOn;
@@ -1020,15 +1898,38 @@ document.addEventListener("click", (e) => {
     case "b-raise": userAct("raise", raiseAmount()); return;
     case "skip": thinking?.ctl.abort(); return;
     case "retry": link = "live"; renderTop(); return;
+    case "tab-solo": case "tab-mp":
+      readSetupInputs();
+      setup.tab = t.id === "tab-mp" ? "mp" : "solo";
+      setup.err = "";
+      openModal(setupHtml(setup.resume), "setup");
+      $(t.id)?.focus();
+      if (!S || S.m.over) renderPreview(setup.tab === "mp" ? setup.mpN : setup.n);
+      return;
+    case "mp-host": hostCreate(); return;
+    case "mp-join": guestJoinFromForm(); return;
+    case "mp-share": shareLink(); return;
+    case "mp-start": hostStart(); return;
+    case "mp-close": hostClose(); return;
+    case "mp-leave": guestLeave(); return;
+    case "mp-other": readSetupInputs(); setup.link = false; setup.code = ""; setup.err = ""; openModal(setupHtml(setup.resume), "setup"); $("mp-code")?.focus(); return;
+    case "mp-home": if (mode === "guest") guestLeave(); else backToStart(); return;
   }
   if (t.dataset.count) {
     setup.n = Number(t.dataset.count);
     const claude = $("m-claude");
     if (claude) setup.claude = claude.checked;
     const resume = !!$("m-resume");
-    openModal(setupHtml(resume));
+    openModal(setupHtml(resume), "setup");
     $("modal-card").querySelector(`[data-count="${setup.n}"]`)?.focus();
     if (!S || S.m.over) renderPreview(setup.n);
+  } else if (t.dataset.mpn && mode === "host" && !room.started) {
+    room.n = setup.mpN = Number(t.dataset.mpn);
+    saveRoom();
+    lobbyBroadcast();
+    showHostLobby();
+    $("modal-card").querySelector(`[data-mpn="${room.n}"]`)?.focus();
+    renderPreview(room.n);
   } else if (t.classList.contains("preset")) {
     setAmount(Number(t.dataset.to));
   } else if (t.dataset.depth) {
@@ -1037,8 +1938,36 @@ document.addEventListener("click", (e) => {
   }
 });
 
+// 참가 링크 공유: 공유 창 → 클립보드 → 글자 선택 (직접 복사)
+async function shareLink() {
+  if (!room?.ready) return;
+  const url = shareUrl(room.code);
+  const note = (text) => {
+    room.note = text;
+    const el = $("share-note");
+    if (el) el.textContent = text;
+  };
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: "홀덤 테이블", text: `홀덤 같이 해요! 방 코드 ${room.code}`, url });
+      note("공유했어요. 친구가 들어오면 아래 목록에 나와요.");
+      return;
+    } catch (e) {
+      if (e?.name === "AbortError") return;
+    }
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    note("링크를 복사했어요. 친구에게 붙여 넣어 보내세요.");
+  } catch {
+    const i = $("mp-url");
+    if (i) { i.focus(); i.select(); i.setSelectionRange(0, i.value.length); }
+    note("링크를 선택했어요. 길게 눌러(또는 Ctrl+C) 복사하세요.");
+  }
+}
+
 function setAmount(v) {
-  const L = PT.legal(S.m, YOU);
+  const L = PT.legal(S.m, ME);
   v = clamp(Number.isFinite(v) ? v : L.minTo, L.minTo, L.maxTo);
   if ($("slider")) $("slider").value = v;
   if ($("amt")) $("amt").value = v;
@@ -1046,21 +1975,34 @@ function setAmount(v) {
 }
 
 document.addEventListener("input", (e) => {
-  if (!S || S.m.hand.toAct !== YOU) return;
+  if (e.target.id === "mp-name") { setup.name = e.target.value; return; }
+  if (e.target.id === "mp-code") {
+    const up = e.target.value.toUpperCase();
+    if (up !== e.target.value) e.target.value = up;
+    setup.code = up;
+    return;
+  }
+  if (!S?.m?.hand || S.m.hand.toAct !== ME) return;
   if (e.target.id === "slider") setAmount(Number(e.target.value));
   else if (e.target.id === "amt") {
     if ($("slider")) $("slider").value = e.target.value;
-    syncRaiseLabel(PT.legal(S.m, YOU));
+    syncRaiseLabel(PT.legal(S.m, ME));
   }
 });
 
 document.addEventListener("change", (e) => {
   if (e.target.id === "m-claude") setup.claude = e.target.checked;
-  else if (e.target.id === "amt" && S?.m.hand.toAct === YOU) setAmount(Number(e.target.value));
+  else if (e.target.id === "amt" && S?.m?.hand?.toAct === ME) setAmount(Number(e.target.value));
 });
 
 document.addEventListener("keydown", (e) => {
-  if (!S || !$("modal").hidden || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return; // 누르고 있어 반복되는 키는 무시
+  if (e.key === "Enter" && !e.isComposing && (e.target.id === "mp-code" || e.target.id === "mp-name")) {
+    e.preventDefault();
+    if (e.target.id === "mp-code" || PokerNet.normCode($("mp-code")?.value)) guestJoinFromForm();
+    else $("mp-code")?.focus();
+    return;
+  }
+  if (!S?.m?.hand || !$("modal").hidden || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return; // 누르고 있어 반복되는 키는 무시
   const typing = e.target.matches?.("input[type=number]");
   const h = S.m.hand, k = e.key.toLowerCase();
   if (e.key === "Enter") {
@@ -1068,7 +2010,7 @@ document.addEventListener("keydown", (e) => {
     else if (h.phase === "done" && !e.target.closest?.("button, summary, input")) { e.preventDefault(); ($("next") || $("show-end"))?.click(); }
     return;
   }
-  if (typing || h.phase !== "bet" || h.toAct !== YOU) return;
+  if (typing || h.phase !== "bet" || h.toAct !== ME) return;
   if (k === "f") $("b-fold")?.click();
   else if (k === "c") $("b-call")?.click();
   else if (k === "r") $("b-raise")?.click();
@@ -1077,22 +2019,70 @@ document.addEventListener("keydown", (e) => {
 // 폰 ↔ 넓은 화면: 자리 배치를 바꾼다
 tallMQ.addEventListener?.("change", () => {
   tableKey = "";
-  if (S) render();
-  else renderPreview(setup.n);
+  if (S?.m?.hand) render();
+  else renderPreview(mode === "host" ? room.n : setup.n);
 });
+
+// 화면이 다시 보이면: 연결을 확인하고 화면 꺼짐 방지를 다시 켠다
+let pageGone = false; // pagehide에서 연결을 닫았다
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || mode === "solo") return;
+  if (pageGone) { location.reload(); return; } // 닫히는 줄 알고 연결을 끊었는데 페이지가 살아 돌아왔다: 새로 연결 (방장은 같은 코드, 손님은 같은 자리)
+  if (!net) return;
+  if (mode === "host") net.wake();
+  else net.check();
+  requestWake();
+});
+
+// 페이지를 닫거나 떠날 때: 방장은 손님들에게 알리고(새로고침이면 같은 코드로 다시 연다), 손님은 연결을 닫는다
+window.addEventListener("pagehide", () => {
+  if (!net) return;
+  pageGone = true;
+  try { net.close(mode === "host" ? "left" : undefined); } catch {}
+  net = null;
+});
+window.addEventListener("pageshow", (e) => { if (e.persisted && mode !== "solo") location.reload(); }); // 뒤로 가기 캐시에서 돌아왔으면 다시 연결
 
 // ===== 시작 =====
 function boot() {
+  if (netOk()) {
+    const code = hashCode();
+    if (code) {
+      // 같은 방에 들어가 있던 손님의 새로고침: 바로 다시 들어간다 (토큰으로 같은 자리)
+      if (profile.last?.code === code && Date.now() - profile.last.at < RESUME_MS && profile.name) {
+        guestJoin(code, profile.name, true);
+        return;
+      }
+      setup.tab = "mp";
+      setup.code = code;
+      setup.link = true;
+      setup.name = profile.name;
+      setup.resume = true;
+      S = load();
+      if (S) render();
+      else renderPreview(setup.n);
+      openModal(setupHtml(true), "setup");
+      $(profile.name ? "mp-join" : "mp-name")?.focus();
+      renderTop();
+      return;
+    }
+    // 방장의 새로고침: 저장한 방을 같은 코드로 다시 연다
+    const saved = loadRoom();
+    if (saved) { hostOpen(saved); return; }
+  } else if (location.hash.startsWith("#join-")) setup.tab = "mp";
+  setup.name = profile.name;
   const saved = load();
   if (saved) {
     S = saved;
-    setup = { n: S.m.players.length, claude: S.claudeOn };
+    setup.n = S.m.players.length;
+    setup.claude = S.claudeOn;
+    setup.resume = true;
     render(); // 저장할 때 진행 중이던 차례·카드 펼치기는 이어하기를 누르면 다시 시작된다
     if (S.m.over) showEnd(); // 마지막 핸드 뒤 결과 창을 보기 전에 닫았으면 결과부터
-    else openModal(setupHtml(true));
+    else openModal(setupHtml(true), "setup");
   } else {
     renderPreview(setup.n);
-    openModal(setupHtml(false));
+    openModal(setupHtml(false), "setup");
   }
   renderTop();
 }

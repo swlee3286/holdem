@@ -54,9 +54,13 @@
 
   <div class="modal" id="modal" hidden><div class="modal-card" id="modal-card" role="dialog" aria-modal="true"></div></div>
 
+  <!-- 친구와 하기(온라인)용 PeerJS(WebRTC). index.html(로컬 · GitHub Pages)에서만 불러온다.
+       artifact.html은 일부러 불러오지 않는다: 아티팩트 안에서는 외부 연결이 막혀 있어 친구와 하기를 끈다 -->
+  <script src="vendor/peerjs.min.js"></script>
   <script src="engine.js"></script>
   <script src="table.js"></script>
   <script src="gto.js"></script>
+  <script src="net.js"></script>
   <script src="game.js"></script>
 </body>
 </html>

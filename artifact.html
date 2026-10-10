@@ -49,7 +49,10 @@
 
 <div class="modal" id="modal" hidden><div class="modal-card" id="modal-card" role="dialog" aria-modal="true"></div></div>
 
+<!-- index.html과 다른 점은 이것 하나: vendor/peerjs.min.js를 일부러 불러오지 않는다.
+     아티팩트 안에서는 외부 연결(WebRTC · WebSocket)이 막혀 있어 친구와 하기를 끄고 GitHub 주소를 안내한다 -->
 <script src="engine.js"></script>
 <script src="table.js"></script>
 <script src="gto.js"></script>
+<script src="net.js"></script>
 <script src="game.js"></script>
