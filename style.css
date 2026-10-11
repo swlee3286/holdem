@@ -472,6 +472,11 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 .lobby .avatar { width: 26px; height: 26px; font-size: 12px; }
 .lob-tag { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .lobby li:not(.ai):not(.away) .lob-tag { color: var(--up); }
+.lob-kick {
+  flex: none; min-height: 28px; padding: 0 9px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: none; color: var(--muted); font: 500 12px var(--body);
+}
+.lob-kick:hover, .lob-kick:focus-visible { color: var(--down); border-color: var(--down); outline: none; }
 .standings-note { margin-top: 10px !important; }
 .lobby + .fine, .modal-actions + .fine { margin-top: 12px; }
 .invite-note { margin-bottom: 6px !important; }
@@ -504,6 +509,9 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 }
 .toast.on { opacity: 1; transform: translate(-50%, 0); }
 
+/* 한글은 낱말 중간에서 줄을 바꾸지 않는다 (띄어쓰기에서만). 너무 긴 낱말만 아무 데서나 */
+.modal-card h1, .modal-card p, .btn, .waiting, .toast { word-break: keep-all; overflow-wrap: anywhere; }
+
 /* ===== 좁은 화면 ===== */
 @media (max-width: 900px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
@@ -535,7 +543,7 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
   .plate { min-width: 0; gap: 5px; padding: 3px 9px 3px 3px; }
   .avatar { width: 26px; height: 26px; font-size: 12px; }
   .seat.me .avatar { font-size: 11px; }
-  .nm b { font-size: 11px; }
+  .nm b { font-size: 11px; max-width: 4.6em; overflow: hidden; text-overflow: ellipsis; } /* 긴 이름이 옆 자리를 화면 밖으로 밀지 않게 */
   .pos { position: absolute; top: -13px; left: 50%; transform: translateX(-50%); font-size: 9px; padding: 0 5px; border-radius: 999px; background: var(--plate); border: 1px solid var(--line); line-height: 1.4; }
   .seat:not(.below) .pos { top: auto; bottom: -13px; } /* 카드가 명패 위에 붙는 자리: 포지션은 명패 아래로 */
   .stack { font-size: 12px; }

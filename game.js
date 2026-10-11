@@ -3,7 +3,8 @@
 const SAVE_KEY = "holdem-table-v2";
 const HINT_KEY = "holdem-table-v2-hint";
 const ROOM_KEY = "holdem-room-v1";   // 방장: 방 · 매치 (새로고침하면 같은 코드로 다시 연다)
-const NET_KEY = "holdem-net-v1";     // 내 이름 · 손님 토큰 · 마지막으로 들어간 방
+const NET_KEY = "holdem-net-v1";     // 내 이름 · 마지막으로 들어간 방 · 방마다 받은 자리 (손님)
+const TAB_KEY = "holdem-net-tab-v1"; // 이 탭이 앉은 자리 (sessionStorage: 새로고침해도 남고 탭마다 다르다)
 const START_STACK = 2000;
 const HANDS_PER_LEVEL = 10;
 const LEVELS = [[10, 20], [15, 30], [20, 40], [30, 60], [40, 80], [50, 100], [75, 150], [100, 200], [150, 300], [200, 400], [300, 600], [400, 800], [500, 1000], [750, 1500], [1000, 2000]];
@@ -80,12 +81,18 @@ const numParam = (k, d, lo, hi) => {
 const TURN_MS = numParam("turnSec", 30, 5, 120) * 1000; // 사람 차례 제한 시간
 const NEXT_MS = numParam("nextSec", 5, 1, 30) * 1000;   // 핸드가 끝나고 다음 핸드까지
 const RESUME_MS = 20 * 60 * 1000;                       // 방장 새로고침 · 손님 재접속을 이어 주는 시간
+const GRACE_MS = 15000;                                 // 끊긴 손님 차례: 이만큼은 사람을 기다린 뒤 AI가 대신 둔다
+const TAKEN_MS = 120000;                                // 방장 새로고침: 서버가 예전 연결을 정리할 때까지 같은 코드로 다시 시도하는 시간
+const CRED_MS = 24 * 60 * 60 * 1000;                    // 손님: 방마다 받은 자리 비밀값을 기억하는 시간
+const tokOk = (x) => typeof x === "string" && /^[A-Za-z0-9_-]{8,48}$/.test(x);
+// 아티팩트 진입 파일(artifact.html)은 PeerJS를 일부러 불러오지 않는다. 태그가 있는데 Peer가 없으면 파일을 못 불러온 것
+const ARTIFACT = !document.querySelector('script[src*="peerjs"]') || !!window.claude;
 
 let mode = "solo";     // solo | host | guest
 let ME = 0;            // 화면 아래 가운데에 앉는 내 좌석
 let net = null;        // PokerNet.createHost / createClient
-let room = null;       // 방장: { code, n, hostName, started, guests, peerToken, ready, status, note, error }
-let guest = null;      // 손님: { code, name, seat, status, lobby, view, at, pending, gone }
+let room = null;       // 방장: { code, n, hostName, started, guests, ready, status, note, error, takenAt }
+let guest = null;      // 손님: { code, name, seat, cred, status, lobby, view, at, pending, gone }
 let turnTimer = 0, nextTimer = 0, tickTimer = 0, pendTimer = 0, toastTimer = 0, retryTimer = 0;
 let wakeLock = null;
 let profile = loadProfile();
@@ -105,7 +112,7 @@ const sampleReady = (async () => {
 })();
 
 // 친구와 하기를 쓸 수 있는지: 아티팩트 안에서는 외부 연결이 막혀 있어 안 된다 (GitHub Pages · 로컬에서만)
-const netOk = () => typeof PokerNet === "object" && !window.claude && PokerNet.supported(NET_KIND);
+const netOk = () => typeof PokerNet === "object" && !ARTIFACT && PokerNet.supported(NET_KIND);
 
 // ===== 매치 =====
 function newMatch(n, claudeOn) {
@@ -617,26 +624,28 @@ function renderLevel() {
 
 // 친구와 하기: 위 막대에 방 코드와 연결 상태
 function renderTopNet() {
-  document.querySelector(".brand span").textContent = "친구와";
+  document.querySelector(".brand span").textContent = "친구와 하기";
   $("new-game").textContent = "나가기";
   $("depth").hidden = true;
   $("retry").hidden = true;
-  let state, text, title;
+  let state, text, title, short;
   const code = (mode === "host" ? room?.code : guest?.code) || "·····";
   if (mode === "host") {
     const total = room.guests.length, on = room.guests.filter((g) => g.connected).length;
     state = !room.ready ? "checking" : room.status === "offline" ? "paused" : "live";
-    text = !room.ready ? `방 ${code} 여는 중` : `방 ${code} · 친구 ${on}/${total}명 연결`;
+    text = !room.ready ? `방 ${code} 여는 중` : `방 ${code} · 친구 ${on}/${total}명 연결` + (room.status === "offline" ? " · 서버 다시 연결 중" : "");
+    short = !room.ready ? "여는 중" : room.status === "offline" ? "다시 연결 중" : code; // 폰은 짧은 글자만 보인다
     title = "내 기기가 딜러예요. 게임이 끝날 때까지 이 화면을 켜 두세요." + (room.status === "offline" ? " 서버와 잠깐 끊겼어요(들어와 있는 친구와는 계속 연결돼요). 다시 연결하는 중이에요." : "");
   } else {
     const st = guest.status;
     state = st === "open" ? "live" : st === "reconnecting" ? "paused" : "checking";
-    text = st === "open" ? `방 ${code} · 연결됨` : st === "reconnecting" ? `방 ${code} · 다시 연결 중…` : `방 ${code} · 연결 중…`;
+    text = st === "open" ? `방 ${code} · 연결됨` : st === "reconnecting" ? `방 ${code} · 다시 연결 중…` : st === "closed" ? `방 ${code} · 끊김` : `방 ${code} · 연결 중…`;
+    short = st === "open" ? code : st === "reconnecting" ? "다시 연결 중" : st === "closed" ? "끊김" : "연결 중";
     title = "방장 기기가 딜러예요. 연결이 끊기면 내 자리는 AI가 대신 두고, 다시 연결되면 돌려받아요.";
   }
   $("link-dot").className = "dot " + state;
   $("link-text").textContent = text;
-  $("link-short").textContent = code;
+  $("link-short").textContent = short;
   $("link").title = title;
   renderLevel();
 }
@@ -680,7 +689,7 @@ function buildTable(n) {
         <div class="hole" id="hole-${s}"></div>
         <div class="plate">
           <span class="avatar" style="--av:${r.color}" aria-hidden="true">${esc(r.initial)}</span>
-          <span class="who"><span class="nm"><b>${esc(r.name)}</b><i class="pos" id="pos-${s}"></i></span><span class="stack" id="stack-${s}">${fmt(START_STACK)}</span><span class="away-note" id="away-${s}" hidden><span class="al">연결 끊김 · AI가 대신</span><span class="as">끊김 · AI</span></span></span>
+          <span class="who"><span class="nm"><b title="${esc(r.name)}">${esc(r.name)}</b><i class="pos" id="pos-${s}"></i></span><span class="stack" id="stack-${s}">${fmt(START_STACK)}</span><span class="away-note" id="away-${s}" hidden><span class="al">연결 끊김 · AI가 대신</span><span class="as">끊김 · AI</span></span></span>
           <span class="dealer" id="dealer-${s}" hidden>D</span>
           <span class="clock" id="clock-${s}" hidden></span>
         </div>
@@ -859,11 +868,13 @@ function cardNode(c) {
 function renderControls() {
   const m = S.m, h = m.hand, box = $("controls");
   const online = h.toAct >= 0 ? seatOnline(h.toAct) : true;
-  const key = [h.no, h.actions.length, h.phase, h.toAct, h.street, m.over, !!thinking, fast, hintOn, S.ended, m.players[ME].out, mode, ME, guest?.pending ? 1 : 0, online].join("|");
+  const down = mode === "guest" && guest.status !== "open"; // 손님: 방장과 끊긴 동안 받은 화면은 멈춰 있다 — 버튼 · 시계를 감춘다
+  const key = [h.no, h.actions.length, h.phase, h.toAct, h.street, m.over, !!thinking, fast, hintOn, S.ended, m.players[ME].out, mode, ME, guest?.pending ? 1 : 0, online, guest?.status, turnLeft() ? 1 : 0].join("|");
   if (key === controlsKey) return;
   controlsKey = key;
-  box.classList.toggle("mine", h.phase === "bet" && h.toAct === ME);
-  if (h.phase === "done") box.innerHTML = doneHtml(h);
+  box.classList.toggle("mine", h.phase === "bet" && h.toAct === ME && !down);
+  if (down) box.innerHTML = `<div class="waiting"><span>${guest.status === "closed" ? "방장과 연결이 끊겼어요" : "방장과 다시 연결하는 중… 잠시만 기다려 주세요"}</span></div>`;
+  else if (h.phase === "done") box.innerHTML = doneHtml(h);
   else if (h.phase === "bet" && h.toAct === ME) {
     const tk = `${m.handNo}|${h.actions.length}`;
     if (tk !== turnKey) { turnKey = tk; turnAt = performance.now(); }
@@ -878,7 +889,10 @@ function waitHtml(h) {
   let msg;
   if (h.phase === "runout") msg = "남은 카드를 펼치는 중…";
   else if (thinking && thinking.hand === h) msg = "Claude가 생각 중…";
-  else if (mode !== "solo" && !seatOnline(h.toAct)) msg = `${esc(nm(h.toAct))} 연결 끊김 · AI가 대신 둡니다`;
+  else if (mode !== "solo" && !seatOnline(h.toAct)) {
+    msg = turnLeft() ? `${esc(nm(h.toAct))} 연결 끊김 · 돌아오길 기다리는 중 <span class="wait-clock" id="wait-clock"></span>` // 잠깐 끊긴 사람: 시계가 도는 동안은 기다린다
+      : `${esc(nm(h.toAct))} 연결 끊김 · AI가 대신 둡니다`;
+  }
   else msg = `${esc(nm(h.toAct))} 차례예요${mode !== "solo" ? ` <span class="wait-clock" id="wait-clock"></span>` : ""}`;
   if (m.players[ME].out) msg = `관전 중 · ${msg}`;
   const ff = out && mode === "solo"
@@ -1012,16 +1026,17 @@ function renderLog() {
 
 // ===== 시계 (친구와 하기: 차례 제한 시간 · 다음 핸드) =====
 // 방장은 자기 시계로, 손님은 받은 '남은 시간'과 받은 때로 센다 (기기마다 시계가 달라서)
+// 손님은 방장과 끊긴 동안 null (받은 남은 시간이 더는 맞지 않다)
 function turnLeft() {
   if (mode === "host" && S?.turn) return { seat: S.turn.seat, left: Math.max(0, S.turn.deadline - Date.now()), total: TURN_MS };
   const v = guest?.view;
-  if (mode === "guest" && v?.turn) return { seat: v.turn.seat, left: Math.max(0, guest.at + v.turn.left - performance.now()), total: v.turn.total };
+  if (mode === "guest" && v?.turn && guest.status === "open") return { seat: v.turn.seat, left: Math.max(0, guest.at + v.turn.left - performance.now()), total: v.turn.total };
   return null;
 }
 function nextLeft() {
   if (mode === "host") return S?.nextAt ? Math.max(0, S.nextAt - Date.now()) : null;
   const v = guest?.view;
-  return mode === "guest" && v && v.next !== null ? Math.max(0, guest.at + v.next - performance.now()) : null;
+  return mode === "guest" && v && v.next !== null && guest.status === "open" ? Math.max(0, guest.at + v.next - performance.now()) : null;
 }
 
 function renderClocks() {
@@ -1141,8 +1156,10 @@ function endHtml() {
   const watch = !m.over ? `<button class="btn" id="m-watch" type="button">계속 지켜보기</button>` : `<button class="btn" id="m-close" type="button">테이블 보기</button>`;
   if (mode !== "solo") {
     const code = mode === "host" ? room.code : guest.code;
+    // 방장이 탈락해도 친구들 게임은 이 기기에서 계속된다: 지켜보기가 먼저, 방 닫기는 한 번 더 묻는다
     const actions = mode === "host"
-      ? `${m.over ? `<button class="btn primary" id="m-again" type="button">다시 하기 · 같은 방</button>` : ""}${watch}<button class="btn" id="mp-close" type="button">방 닫기</button>`
+      ? (m.over ? `<button class="btn primary" id="m-again" type="button">다시 하기 · 같은 방</button>${watch}<button class="btn" id="mp-close" type="button">방 닫기</button>`
+        : `<button class="btn primary" id="m-watch" type="button">계속 지켜보기</button><button class="btn" id="mp-close-ask" type="button">방 닫기</button>`)
       : `${watch}<button class="btn" id="mp-leave" type="button">나가기</button>`;
     return `
       <p class="eyebrow">${eyebrow}</p>
@@ -1154,6 +1171,7 @@ function endHtml() {
       </dl>
       ${standingsHtml()}
       ${mode === "guest" && m.over ? `<p class="fine standings-note">방장이 ‘다시 하기’를 누르면 같은 자리로 새 게임이 시작돼요.</p>` : ""}
+      ${mode === "host" && !m.over ? `<p class="fine standings-note">친구들 게임은 계속돼요. 내 기기가 딜러라서 끝날 때까지 이 화면을 켜 두세요.</p>` : ""}
       <div class="modal-actions">${actions}</div>`;
   }
   const vpip = st.hands ? Math.round((100 * st.vpip) / st.hands) : 0;
@@ -1195,17 +1213,68 @@ function resumeMatch() {
 }
 
 // ===== 친구와 하기: 첫 화면 =====
+// 손님의 자리는 방마다 따로: 방장이 처음 앉힐 때 준 {gid, secret}을 그 방 코드에만 쓴다 (다른 방장에게는 보내지 않는다)
 function loadProfile() {
   let p = null;
   try { p = JSON.parse(localStorage.getItem(NET_KEY)); } catch {}
   if (!p || typeof p !== "object") p = {};
   const ok = typeof PokerNet === "object";
-  const token = typeof p.token === "string" && /^[A-Za-z0-9_-]{8,48}$/.test(p.token) ? p.token : ok ? PokerNet.newToken() : "";
   const last = p.last && typeof p.last.code === "string" && Number.isFinite(p.last.at) ? { code: p.last.code, at: p.last.at } : null;
-  return { name: ok ? PokerNet.cleanName(p.name) : "", token, last };
+  const rooms = {};
+  if (p.rooms && typeof p.rooms === "object") {
+    for (const [code, c] of Object.entries(p.rooms)) {
+      if (c && tokOk(c.gid) && tokOk(c.secret) && Number.isFinite(c.at) && Date.now() - c.at < CRED_MS) rooms[code] = { gid: c.gid, secret: c.secret, at: c.at };
+    }
+  }
+  return { name: ok ? PokerNet.cleanName(p.name) : "", last, rooms };
 }
 function saveProfile() {
   try { localStorage.setItem(NET_KEY, JSON.stringify(profile)); } catch {}
+}
+// 받은 자리를 기억한다: 이 탭(sessionStorage) + 이 브라우저(localStorage, 창을 닫았다 다시 열 때). 최근 8개 방까지만
+function saveCred(code, cred) {
+  profile.rooms[code] = { gid: cred.gid, secret: cred.secret, at: Date.now() };
+  for (const c of Object.keys(profile.rooms).sort((a, b) => profile.rooms[b].at - profile.rooms[a].at).slice(8)) delete profile.rooms[c];
+  saveProfile();
+  try { sessionStorage.setItem(TAB_KEY, JSON.stringify({ code, gid: cred.gid, secret: cred.secret })); } catch {}
+}
+function tabCred(code) {
+  try {
+    const t = JSON.parse(sessionStorage.getItem(TAB_KEY));
+    if (t && t.code === code && tokOk(t.gid) && tokOk(t.secret)) return { gid: t.gid, secret: t.secret };
+  } catch {}
+  return null;
+}
+// 이 방에서 받은 자리. 이 탭 것이 아니고 같은 브라우저의 다른 탭이 지금 그 자리에 앉아 있으면 쓰지 않는다 (새 손님으로)
+async function credFor(code) {
+  const mine = tabCred(code);
+  if (mine) return mine;
+  const c = profile.rooms[code];
+  if (!c) return null;
+  return (await tabProbe("guest", code, c.gid)) ? null : { gid: c.gid, secret: c.secret };
+}
+
+// ===== 같은 브라우저의 다른 탭 =====
+// 방장 탭 · 손님 탭은 물어보면 대답한다. 한 방을 두 탭에서 여는 것(방장)과 한 자리에 두 탭이 앉는 것(손님)을 막는다
+const tabsCh = typeof BroadcastChannel === "function" ? new BroadcastChannel("holdem-tabs") : null;
+if (tabsCh) {
+  tabsCh.onmessage = (e) => {
+    const m = e.data;
+    if (!m || m.k !== "probe") return;
+    const here = m.kind === "host" ? mode === "host" && room?.code === m.code
+      : mode === "guest" && guest?.code === m.code && !!guest.cred && guest.cred.gid === m.gid;
+    if (here) tabsCh.postMessage({ k: "here", id: m.id });
+  };
+}
+function tabProbe(kind, code, gid) {
+  if (!tabsCh) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const id = PokerNet.newToken(10), ch = new BroadcastChannel("holdem-tabs");
+    const done = (v) => { clearTimeout(t); ch.close(); resolve(v); };
+    const t = setTimeout(() => done(false), 350);
+    ch.onmessage = (e) => { if (e.data?.k === "here" && e.data.id === id) done(true); };
+    ch.postMessage({ k: "probe", kind, code, gid, id });
+  });
 }
 
 // 주소의 #join-코드 (참가 링크)
@@ -1216,25 +1285,35 @@ function hashCode() {
 function setHash(code) {
   try { history.replaceState(null, "", code ? `#join-${code}` : location.pathname + location.search); } catch {}
 }
-// 참가 링크: 지금 주소에서 만든다 (GitHub Pages면 https://swlee3286.github.io/holdem/#join-코드, 로컬도 그대로)
-const shareUrl = (code) => location.href.split("#")[0].replace(/index\.html$/, "") + "#join-" + code;
+// 참가 링크: 지금 주소에서 만든다 (GitHub Pages면 https://swlee3286.github.io/holdem/#join-코드).
+// 시험용 주소 파라미터는 localhost에서만 옮긴다 (진짜 사이트의 링크에 시그널링 서버 설정이 끼어 다니지 않게)
+const shareUrl = (code) => {
+  const local = typeof PokerNet === "object" && PokerNet.isLocalHost(location.hostname);
+  const query = local ? location.search : NET_KIND === "local" ? "?net=local" : "";
+  return location.href.split(/[?#]/)[0].replace(/index\.html$/, "") + query + "#join-" + code;
+};
 
 function netMenuHtml() {
-  if (!netOk() && !window.claude) {
-    return `
-      <p class="eyebrow">각자 폰으로 · 온라인</p>
-      <h1>친구와 한 테이블</h1>
-      <p>이 브라우저에서는 온라인 연결(WebRTC)을 쓸 수 없어요. 최신 Chrome · Safari · 삼성 인터넷에서 열어 주세요.</p>
-      <p class="url-line">${esc(PUBLIC_URL)}</p>`;
-  }
   if (!netOk()) {
-    return `
+    // 안 되는 까닭을 나눠 알린다: 아티팩트 · 브라우저가 WebRTC를 못 씀 · 온라인 파일(PeerJS)을 못 불러옴
+    const code = hashCode();
+    const url = PUBLIC_URL + (code ? `#join-${code}` : "");
+    const head = `
       <p class="eyebrow">각자 폰으로 · 온라인</p>
-      <h1>친구와 한 테이블</h1>
+      <h1>친구와 한 테이블</h1>`;
+    if (ARTIFACT) {
+      return `${head}
       <p>친구와 하기는 이 화면에서는 쓸 수 없어요. Claude 아티팩트 안에서는 외부 연결이 막혀 있거든요.</p>
       <p>아래 GitHub 주소로 열면 친구들이 각자 폰으로 들어와 같이 할 수 있어요.</p>
-      <p class="url-line">${esc(PUBLIC_URL)}</p>
+      <p class="url-line">${esc(url)}</p>
       <p class="fine">혼자 하기(Claude와 AI 상대)는 여기서 그대로 할 수 있어요.</p>`;
+    }
+    const noRtc = NET_KIND === "local" ? typeof BroadcastChannel !== "function" : typeof RTCPeerConnection !== "function";
+    return noRtc ? `${head}
+      <p>이 브라우저에서는 온라인 연결(WebRTC)을 쓸 수 없어요. 최신 Chrome · Safari · 삼성 인터넷에서 열어 주세요.</p>
+      <p class="url-line">${esc(url)}</p>` : `${head}
+      <p class="net-error" role="alert">온라인 기능을 불러오지 못했어요. 인터넷 연결을 확인하고 새로고침해 주세요.</p>
+      <p class="url-line">${esc(url)}</p>`;
   }
   const err = setup.err ? `<p class="net-error" role="alert">${esc(setup.err)}</p>` : "";
   const nameField = `
@@ -1308,7 +1387,7 @@ function backToStart(err = "") {
   clearTimeout(pendTimer);
   clearTimeout(retryTimer);
   releaseWake();
-  if (net) { try { net.close(mode === "host" ? "closed" : undefined); } catch {} }
+  if (net) { try { net.close(mode === "host" ? "closed" : true); } catch {} } // 손님: 나간다고 알린다 (시작 전이면 자리를 비운다)
   net = null;
   mode = "solo";
   ME = 0;
@@ -1363,12 +1442,14 @@ function toast(text) {
   toastTimer = setTimeout(() => el.classList.remove("on"), 3500);
 }
 
-function lobbyRows(list, mine) {
+// kick: 방장 로비 — 손님 줄에 '내보내기' (끊긴 채 돌아오지 않는 손님 · 모르는 사람)
+function lobbyRows(list, mine, kick) {
   return list.map((p) => {
     const r = ROSTER[p.seat] ?? ROSTER[0];
     const initial = p.kind === "ai" && p.name === r.name ? r.initial : Array.from(p.name)[0] || "?";
     const tag = p.isHost ? "방장" : p.kind === "ai" ? "AI" : p.connected ? "들어옴" : "연결 끊김";
-    return `<li class="${p.seat === mine ? "me" : ""}${p.kind === "ai" ? " ai" : ""}${p.connected ? "" : " away"}"><span class="avatar" style="--av:${r.color}" aria-hidden="true">${esc(initial)}</span><b>${esc(p.name)}</b>${p.seat === mine ? `<small>나</small>` : ""}<span class="lob-tag">${tag}</span></li>`;
+    const out = kick && !p.isHost && p.kind === "human" ? `<button class="lob-kick" type="button" data-kick="${p.seat}" aria-label="${esc(p.name)} 내보내기">내보내기</button>` : "";
+    return `<li class="${p.seat === mine ? "me" : ""}${p.kind === "ai" ? " ai" : ""}${p.connected ? "" : " away"}"><span class="avatar" style="--av:${r.color}" aria-hidden="true">${esc(initial)}</span><b>${esc(p.name)}</b>${p.seat === mine ? `<small>나</small>` : ""}<span class="lob-tag">${tag}</span>${out}</li>`;
   }).join("");
 }
 
@@ -1377,6 +1458,7 @@ function hostCreate() {
   readSetupInputs();
   const name = PokerNet.cleanName(setup.name);
   if (!name) { setupError("이름을 적어 주세요", "mp-name"); return; }
+  if (name === "나") { setupError("‘나’는 친구 화면에서 헷갈려요. 다른 이름을 적어 주세요", "mp-name"); return; }
   setup.err = "";
   profile.name = name;
   saveProfile();
@@ -1393,10 +1475,10 @@ function hostOpen(saved, hostName) {
     S = saved.S;
     if (S) { S.turn = null; S.nextAt = 0; }
   } else {
-    room = { code: "", n: setup.mpN, hostName: PokerNet.cleanName(hostName, "방장"), started: false, guests: [], peerToken: PokerNet.newToken(24) };
+    room = { code: "", n: setup.mpN, hostName: PokerNet.createRoom(setup.mpN, hostName).hostName, started: false, guests: [] };
     S = null;
   }
-  Object.assign(room, { ready: false, status: "checking", note: "", error: "" });
+  Object.assign(room, { ready: false, status: "checking", note: "", error: "", takenAt: 0 });
   startTicker();
   requestWake();
   hostConnect(!!saved);
@@ -1417,12 +1499,16 @@ function hostOpen(saved, hostName) {
 
 function hostConnect(resume) {
   if (net) net.close("left");
-  net = PokerNet.createHost({ kind: NET_KIND, code: room.code || undefined, peerToken: room.peerToken, resume: resume || !!room.code, params: QS }, {
+  net = PokerNet.createHost({ kind: NET_KIND, code: room.code || undefined, resume: resume || !!room.code, params: QS }, {
+    lookup: (gid) => room.guests.find((g) => g.gid === gid)?.secret || null, // 자리를 되찾는 손님 확인용
     onReady(code) {
       room.code = code;
       room.ready = true;
       room.error = "";
       room.status = "online";
+      room.takenAt = 0;
+      // 다시 열었으면: 아직 안 돌아온 손님에게 지금부터 잠깐 기다릴 시간을 준다 (그 사이 그 자리 차례를 AI가 바로 두지 않게)
+      for (const g of room.guests) if (!g.connected && g.lostAt) g.lostAt = Date.now();
       saveRoom();
       if (S && room.started) {
         if (modalScreen === "resume") closeModal();
@@ -1443,16 +1529,23 @@ function hostConnect(resume) {
 }
 
 function hostNetError(code) {
-  let msg;
-  if (code === "id-taken") msg = room.code ? `방 코드 ${room.code}를 다시 열 수 없어요. 방을 닫고 새로 만들어 주세요.` : "방 코드를 만들지 못했어요. 잠시 뒤 다시 해 주세요.";
+  let msg, again = 0;
+  if (code === "id-taken" && room.code) {
+    // 다시 열 때 코드가 쓰이는 중: 대개 서버가 끊긴 예전 연결을 아직 들고 있는 것 (1~2분 뒤 정리된다). 그동안 계속 다시 시도
+    room.takenAt ||= Date.now();
+    if (Date.now() - room.takenAt < TAKEN_MS) {
+      msg = `서버가 방 ${room.code}의 예전 연결을 정리하는 중이에요. 1~2분 걸릴 수 있어요. 계속 다시 시도해요.`;
+      again = 5000;
+    } else msg = `방 코드 ${room.code}를 다른 곳에서 쓰고 있어요. 방을 닫고 새로 만들어 주세요.`;
+  } else if (code === "id-taken") msg = "방 코드를 만들지 못했어요. 잠시 뒤 다시 해 주세요.";
   else if (code === "unsupported") msg = "이 브라우저는 온라인 연결(WebRTC)을 지원하지 않아요.";
-  else msg = "연결 서버에 닿지 않아요. 인터넷 연결을 확인해 주세요. 계속 다시 시도해요.";
+  else { msg = "연결 서버에 닿지 않아요. 인터넷 연결을 확인해 주세요. 계속 다시 시도해요."; again = 4000; }
   room.error = msg;
   room.status = "offline";
-  // 서버에 못 닿았으면 같은 코드로 잠시 뒤 다시 연다
-  if (code === "network" && mode === "host") {
+  // 같은 코드로 잠시 뒤 다시 연다
+  if (again && mode === "host") {
     clearTimeout(retryTimer);
-    retryTimer = setTimeout(() => { if (mode === "host" && room && !room.ready) hostConnect(true); }, 4000);
+    retryTimer = setTimeout(() => { if (mode === "host" && room && !room.ready) hostConnect(true); }, again);
   }
   if (modalScreen === "resume") {
     const el = $("resume-error");
@@ -1512,9 +1605,9 @@ function hostLobbyHtml() {
       <span class="field-label" id="mpn-label">인원</span>
       <div class="seg count" role="group" aria-labelledby="mpn-label">${counts}</div>
     </div>
-    <ul class="lobby">${lobbyRows(hostLobbyPlayers(), 0)}</ul>
+    <ul class="lobby">${lobbyRows(hostLobbyPlayers(), 0, true)}</ul>
     <div class="modal-actions">
-      <button class="btn primary" id="mp-start" type="button" ${can ? "" : "disabled"}>${can ? `${n}명으로 시작` : "친구가 들어오면 시작"}</button>
+      <button class="btn primary" id="mp-start" type="button" ${can ? "" : "disabled"}>${can ? `${n}명으로 시작` : "친구를 기다리는 중"}</button>
       <button class="btn" id="mp-close" type="button">방 닫기</button>
     </div>
     <p class="fine">빈 자리는 AI(GTO 엔진)가 앉아요. 내 기기가 딜러라서 게임이 끝날 때까지 이 화면을 켜 두세요.</p>`;
@@ -1525,12 +1618,14 @@ function showHostLobby() {
   showScreen("lobby", hostLobbyHtml());
 }
 
+// msg = {name, gid}: gid는 net.js가 서로 확인(auth)을 마친 손님만 (버전 · 증명 검사도 net.js에서)
 function hostHello(id, msg) {
-  if (msg.v !== PokerNet.V) { net.drop(id, { t: "error", msg: "게임 버전이 달라요. 페이지를 새로고침해 주세요", fatal: true }); return; }
+  if (!room.ready) { net.drop(id); return; }
   const r = PokerNet.roomJoin(room, msg, id); // 이름이 겹치면 숫자를 붙인다 (AI 이름은 시작할 때 피해 간다)
   if (!r.ok) { net.drop(id, { t: "error", msg: r.msg, fatal: true }); return; }
   if (r.replaced) net.drop(r.replaced, { t: "error", msg: "다른 곳에서 이 자리로 다시 들어왔어요", fatal: true });
-  net.send(id, { t: "welcome", seat: r.seat });
+  // 새 자리면 그 자리 비밀값을 이 손님에게만 한 번 준다 (다시 붙을 때는 증명만 오간다)
+  net.send(id, r.secret ? { t: "welcome", seat: r.seat, gid: r.gid, secret: r.secret } : { t: "welcome", seat: r.seat, gid: r.gid });
   saveRoom();
   lobbyBroadcast();
   if (room.started && S) {
@@ -1548,15 +1643,33 @@ function hostAct(id, msg) {
   doAct(g.seat, r.type, r.to);
 }
 
-function hostLeave(id) {
+// left: 손님이 스스로 나갔다. 시작 전이면 자리를 비우고, 시작 뒤면 기다리지 않고 AI가 대신 둔다.
+// 그냥 끊겼으면 자리를 남겨 두고(시작 전 로비도) 같은 기기로 돌아오면 되찾는다
+function hostLeave(id, left) {
   const seat = PokerNet.roomLeave(room, id);
   if (seat < 0) return;
+  if (left && !room.started) PokerNet.roomRemove(room, seat);
+  else if (left) PokerNet.roomGuestAt(room, seat).lostAt = 0;
   saveRoom();
   lobbyBroadcast();
   if (room.started && S) {
-    toast(`${S.m.players[seat].name} 연결 끊김 · AI가 대신 둡니다`);
-    advance(); // 그 자리 차례였다면 AI가 대신
+    toast(left ? `${S.m.players[seat].name} 나감 · AI가 대신 둡니다` : `${S.m.players[seat].name} 연결 끊김 · 곧 돌아오지 않으면 AI가 대신 둬요`);
+    advance(); // 그 자리 차례였다면 잠깐 기다렸다가 AI가 대신
   } else showHostLobby();
+  renderTop();
+}
+
+// 방장 로비: 손님 내보내기 (시작 전에만)
+function hostKick(seat) {
+  if (mode !== "host" || room.started) return;
+  const g = PokerNet.roomGuestAt(room, seat);
+  if (!g) return;
+  PokerNet.roomRemove(room, seat);
+  if (g.conn) net?.drop(g.conn, { t: "error", msg: "방장이 방에서 내보냈어요", fatal: true });
+  saveRoom();
+  lobbyBroadcast();
+  showHostLobby();
+  renderPreview(room.n);
   renderTop();
 }
 
@@ -1615,10 +1728,15 @@ function hostSchedule() {
     }, 900);
   } else if (h.phase === "bet") {
     const seat = h.toAct, p = m.players[seat];
-    if (p.kind === "human" || (p.kind === "remote" && seatOnline(seat))) {
+    // 방금 끊긴 손님(새로고침 · 잠깐 끊김)은 GRACE_MS 동안 사람 차례처럼 기다린다. 그 사이 시간이 다 되면 체크 · 폴드
+    const g = p.kind === "remote" && !seatOnline(seat) ? PokerNet.roomGuestAt(room, seat) : null;
+    const grace = g && g.lostAt ? g.lostAt + GRACE_MS - Date.now() : 0;
+    if (p.kind === "human" || (p.kind === "remote" && (seatOnline(seat) || grace > 0))) {
       const key = `${h.no}|${h.actions.length}|${seat}`;
       if (S.turn?.key !== key) S.turn = { key, seat, deadline: Date.now() + TURN_MS };
-      turnTimer = setTimeout(() => turnTimeout(m, h, seat), Math.max(0, S.turn.deadline - Date.now()));
+      const left = Math.max(0, S.turn.deadline - Date.now());
+      if (grace > 0 && grace < left) turnTimer = setTimeout(() => { if (S && S.m === m && m.hand === h && h.toAct === seat) advance(); }, grace); // 돌아오지 않으면 AI가 대신
+      else turnTimer = setTimeout(() => turnTimeout(m, h, seat), left);
     } else {
       S.turn = null;
       timer = setTimeout(() => botTurn(m, h, seat), 450 + Math.random() * 450);
@@ -1662,8 +1780,8 @@ function hostBroadcast() {
 function saveRoom() {
   if (mode !== "host" || !room?.code) return;
   const data = {
-    v: 1, at: Date.now(),
-    room: { code: room.code, n: room.n, hostName: room.hostName, started: room.started, peerToken: room.peerToken, guests: room.guests.map((g) => ({ seat: g.seat, name: g.name, token: g.token })) },
+    v: 2, at: Date.now(),
+    room: { code: room.code, n: room.n, hostName: room.hostName, started: room.started, guests: room.guests.map((g) => ({ seat: g.seat, name: g.name, gid: g.gid, secret: g.secret })) },
     S: room.started ? S : null,
   };
   try { localStorage.setItem(ROOM_KEY, JSON.stringify(data)); } catch {}
@@ -1672,15 +1790,15 @@ function saveRoom() {
 function loadRoom() {
   try {
     const d = JSON.parse(localStorage.getItem(ROOM_KEY));
-    if (!d || d.v !== 1 || !d.room || !Number.isFinite(d.at) || Date.now() - d.at > RESUME_MS) return null;
+    if (!d || d.v !== 2 || !d.room || !Number.isFinite(d.at) || Date.now() - d.at > RESUME_MS) return null;
     const r = d.room;
-    if (!PokerNet.normCode(r.code) || !(r.n >= 2 && r.n <= 6) || !Array.isArray(r.guests) || typeof r.peerToken !== "string") return null;
+    if (!PokerNet.normCode(r.code) || !(r.n >= 2 && r.n <= 6) || !Array.isArray(r.guests) || !r.guests.every((g) => tokOk(g?.gid) && tokOk(g?.secret))) return null;
     const S0 = r.started ? d.S : null;
     if (r.started && (!S0?.m?.hand || S0.m.players.length !== r.n || !S0.matchId || !S0.logAt)) return null;
     return {
-      // 시작 전 로비는 손님 목록을 비운다 (다시 들어오면 새로 앉는다)
-      room: { code: r.code, n: r.n, hostName: PokerNet.cleanName(r.hostName, "방장"), started: !!r.started, peerToken: r.peerToken,
-        guests: r.started ? r.guests.map((g) => ({ seat: g.seat, name: g.name, token: g.token, conn: null, connected: false })) : [] },
+      // 손님은 모두 끊긴 상태로 시작한다. 돌아오면 같은 자리 (onReady에서 잠깐 기다릴 시간을 준다)
+      room: { code: r.code, n: r.n, hostName: PokerNet.cleanName(r.hostName, "방장"), started: !!r.started,
+        guests: r.guests.map((g) => ({ seat: g.seat, name: g.name, gid: g.gid, secret: g.secret, conn: null, connected: false, lostAt: 1 })) },
       S: S0,
     };
   } catch {
@@ -1704,22 +1822,31 @@ function guestJoinFromForm() {
   setup.err = "";
   profile.name = name;
   saveProfile();
-  guestJoin(code, name, false);
+  if (joining) return;
+  joining = true; // 다른 탭에 물어보는 동안(잠깐) 두 번 누르지 않게
+  credFor(code).then((cred) => { joining = false; if (mode === "solo") guestJoin(code, name, false, cred); });
 }
+let joining = false;
 
-// persistent: 새로고침 뒤 다시 들어가는 중 (방이 잠깐 안 보여도 계속 시도)
-function guestJoin(code, name, persistent) {
+// persistent: 새로고침 뒤 다시 들어가는 중 (방이 잠깐 안 보여도 계속 시도). cred: 이 방에서 전에 받은 자리 (없으면 새로 앉는다)
+function guestJoin(code, name, persistent, cred) {
   leaveSolo();
   mode = "guest";
   ME = 0;
-  guest = { code, name, seat: -1, status: "connecting", lobby: null, view: null, at: 0, pending: null, gone: "" };
+  guest = { code, name, seat: -1, cred: cred || null, status: "connecting", lobby: null, view: null, at: 0, pending: null, gone: "" };
   profile.last = { code, at: Date.now() };
   saveProfile();
   setHash(code);
   startTicker();
-  net = PokerNet.createClient({ kind: NET_KIND, code, name, token: profile.token, persistent, params: QS }, {
+  // 방장이 오래(새로고침 · 전화 · 잠깐 멈춤) 걸려 돌아와도 이어지게 방장이 방을 기억하는 시간만큼 다시 시도한다
+  net = PokerNet.createClient({ kind: NET_KIND, code, name, cred, persistent, params: QS, giveUpMs: RESUME_MS }, {
+    onCred(c) { // 새 자리를 받았다: 이 방에서만 쓴다
+      guest.cred = c;
+      saveCred(code, c);
+    },
     onWelcome(seat) {
       guest.seat = seat;
+      if (guest.cred) saveCred(code, guest.cred); // 이 탭의 자리로 (다른 탭이 같은 자리를 쓰지 않게)
       if (!S) guestScreen();
     },
     onLobby(msg) {
@@ -1738,11 +1865,12 @@ function guestJoin(code, name, persistent) {
       if (reason === "closed") guestStop("방장이 방을 닫았어요", true);
       else { guest.gone = "left"; showHostLeft(); }
     },
-    onStatus(st) {
+    onStatus(st, why) {
       guest.status = st;
+      if (why === "impostor") toast("방장이 아닌 곳에 연결돼서 끊었어요. 다시 연결하는 중…");
       renderTop();
       if (!S) guestScreen();
-      else if (st === "reconnecting") { controlsKey = ""; render(); }
+      else { controlsKey = ""; render(); }
     },
     onFatal(code) {
       guestStop({
@@ -1751,6 +1879,7 @@ function guestJoin(code, name, persistent) {
         network: "연결 서버에 닿지 않아요. 인터넷 연결을 확인해 주세요.",
         unsupported: "이 브라우저는 온라인 연결(WebRTC)을 지원하지 않아요.",
         gone: "방장과 연결이 끊겼어요. 방장이 돌아오지 않았어요.",
+        impostor: "방장을 확인하지 못했어요. 방장에게 방이 열려 있는지 물어보고 다시 들어와 주세요.",
       }[code] || "연결이 끊겼어요.", !!S);
     },
   });
@@ -1760,7 +1889,7 @@ function guestJoin(code, name, persistent) {
 
 function guestWaitHtml() {
   const g = guest, lob = g.lobby;
-  const title = g.status === "reconnecting" ? "다시 연결하는 중…" : !lob ? "방에 들어가는 중…" : lob.started ? "게임에 들어가는 중…" : "방장이 시작하기를 기다리는 중";
+  const title = g.status === "reconnecting" ? "다시 연결하는 중…" : !lob ? "방에 들어가는 중…" : lob.started ? "게임에 들어가는 중…" : "시작을 기다리는 중";
   return `
     <p class="eyebrow">친구와 하기 · 방 ${esc(g.code)}</p>
     <h1>${title}</h1>
@@ -1782,7 +1911,11 @@ function guestState(view) {
   guest.status = "open";
   if (guest.pending) { guest.pending = null; clearTimeout(pendTimer); }
   if (guest.gone) { guest.gone = ""; if (modalScreen === "left") closeModal(); }
-  if (Date.now() - profile.last?.at > 30000) { profile.last = { code: guest.code, at: Date.now() }; saveProfile(); }
+  if (Date.now() - profile.last?.at > 30000) {
+    profile.last = { code: guest.code, at: Date.now() };
+    if (guest.cred) saveCred(guest.code, guest.cred); // 자리 기억도 새로 (saveProfile 포함)
+    else saveProfile();
+  }
   if (!S || S.matchId !== view.match) { // 첫 화면 · 새 매치(다시 하기)
     S = { v: 2, m: null, claudeOn: false, stats: null, history: [], log: [], logAt: null, say: null, biggestPot: 0, doneNo: 0, ended: "", watched: false, matchId: view.match };
     tableKey = controlsKey = logKey = turnKey = "";
@@ -1911,6 +2044,7 @@ document.addEventListener("click", (e) => {
     case "mp-share": shareLink(); return;
     case "mp-start": hostStart(); return;
     case "mp-close": hostClose(); return;
+    case "mp-close-ask": openModal(leaveConfirmHtml(), "leave"); return;
     case "mp-leave": guestLeave(); return;
     case "mp-other": readSetupInputs(); setup.link = false; setup.code = ""; setup.err = ""; openModal(setupHtml(setup.resume), "setup"); $("mp-code")?.focus(); return;
     case "mp-home": if (mode === "guest") guestLeave(); else backToStart(); return;
@@ -1923,6 +2057,8 @@ document.addEventListener("click", (e) => {
     openModal(setupHtml(resume), "setup");
     $("modal-card").querySelector(`[data-count="${setup.n}"]`)?.focus();
     if (!S || S.m.over) renderPreview(setup.n);
+  } else if (t.dataset.kick && mode === "host") {
+    hostKick(Number(t.dataset.kick));
   } else if (t.dataset.mpn && mode === "host" && !room.started) {
     room.n = setup.mpN = Number(t.dataset.mpn);
     saveRoom();
@@ -2048,28 +2184,46 @@ function boot() {
   if (netOk()) {
     const code = hashCode();
     if (code) {
-      // 같은 방에 들어가 있던 손님의 새로고침: 바로 다시 들어간다 (토큰으로 같은 자리)
+      // 같은 방에 들어가 있던 손님의 새로고침: 바로 다시 들어간다 (이 방에서 받은 자리로).
+      // 같은 브라우저의 다른 탭이 그 자리에 앉아 있으면 새 손님으로 (이름만 적으면 들어간다)
       if (profile.last?.code === code && Date.now() - profile.last.at < RESUME_MS && profile.name) {
-        guestJoin(code, profile.name, true);
+        credFor(code).then((cred) => { if (cred) guestJoin(code, profile.name, true, cred); else bootJoinForm(code); });
         return;
       }
-      setup.tab = "mp";
-      setup.code = code;
-      setup.link = true;
-      setup.name = profile.name;
-      setup.resume = true;
-      S = load();
-      if (S) render();
-      else renderPreview(setup.n);
-      openModal(setupHtml(true), "setup");
-      $(profile.name ? "mp-join" : "mp-name")?.focus();
-      renderTop();
+      bootJoinForm(code);
       return;
     }
-    // 방장의 새로고침: 저장한 방을 같은 코드로 다시 연다
+    // 방장의 새로고침: 저장한 방을 같은 코드로 다시 연다. 다른 탭에서 이미 열려 있으면 열지 않는다 (한 방에 딜러 둘이 되지 않게)
     const saved = loadRoom();
-    if (saved) { hostOpen(saved); return; }
+    if (saved) {
+      tabProbe("host", saved.room.code).then((busy) => {
+        if (!busy) { hostOpen(saved); return; }
+        setup.tab = "mp";
+        setup.err = `방 ${saved.room.code}은(는) 이 브라우저의 다른 탭에서 열려 있어요. 그 탭에서 계속하세요.`;
+        bootSolo();
+      });
+      return;
+    }
   } else if (location.hash.startsWith("#join-")) setup.tab = "mp";
+  bootSolo();
+}
+
+// 참가 링크로 들어왔다: 이름만 적으면 들어가는 창
+function bootJoinForm(code) {
+  setup.tab = "mp";
+  setup.code = code;
+  setup.link = true;
+  setup.name = profile.name;
+  setup.resume = true;
+  S = load();
+  if (S) render();
+  else renderPreview(setup.n);
+  openModal(setupHtml(true), "setup");
+  $(profile.name ? "mp-join" : "mp-name")?.focus();
+  renderTop();
+}
+
+function bootSolo() {
   setup.name = profile.name;
   const saved = load();
   if (saved) {

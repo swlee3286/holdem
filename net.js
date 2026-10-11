@@ -9,7 +9,7 @@ const isNode = typeof module !== "undefined" && typeof require === "function";
 const PT = isNode ? require("./table.js") : root.PokerTable;
 
 // ===== 상수 =====
-const V = 1;                                        // 프로토콜 버전
+const V = 2;                                        // 프로토콜 버전 (2: 방마다 자리 비밀값 · 서로 확인하는 재접속)
 const CODE_ALPHA = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // 헷갈리는 0 · O · 1 · I · L 은 뺐다
 const CODE_LEN = 5;
 const ID_PREFIX = "holdem-";                         // PeerJS 방장 아이디 = holdem-코드
@@ -18,7 +18,12 @@ const MAX_IN = 2048;                                 // 손님 → 방장 메시
 const MAX_OUT = 262144;                              // 방장 → 손님
 const PING_MS = 3000;                                // 손님이 이 간격으로 ping
 const DEAD_MS = 10000;                               // 이만큼 아무 소식이 없으면 끊긴 것으로 본다
+const HELLO_MS = 8000;                               // 연결하고 이 안에 확인(hello · auth)을 마치지 못하면 끊는다
+const MAX_CONNS = 12;                                // 방장이 한꺼번에 받는 연결 수 (6자리 + 다시 붙는 중인 연결)
 const TOKEN_RE = /^[A-Za-z0-9_-]{8,48}$/;
+const PROOF_RE = /^[0-9a-f]{64}$/;
+const RESERVED = ["나", "방장"];                     // 화면에서 '나' · 방장 표시와 헷갈리는 이름은 손님이 쓰지 못한다
+const LOCAL_HOSTS = ["localhost", "127.0.0.1", "[::1]", "::1"];
 const ACT_TYPES = ["fold", "check", "call", "raise"];
 const ACTION_TYPES = ["sb", "bb", "fold", "check", "call", "bet", "raise", "return"];
 
@@ -70,6 +75,61 @@ function parseJSON(raw, max) {
     return null;
   }
 }
+
+// ===== HMAC-SHA256: 재접속할 때 방장과 손님이 서로 같은 자리 비밀값을 가졌는지 확인한다 =====
+// 비밀값 자체는 처음 앉을 때 한 번만 오가고, 다시 붙을 때는 증명(HMAC)만 보낸다. 방장 코드를 가로챈 쪽은 아무것도 얻지 못한다.
+// crypto.subtle은 HTTPS · localhost에서만 있어서(같은 와이파이의 http 주소에서는 없다) 작은 순수 JS 구현을 쓴다
+const SHA_K = [], SHA_H0 = [];
+(function () {
+  const frac = (x) => Math.floor((x - Math.floor(x)) * 0x100000000) | 0;
+  for (let p = 2, found = 0; found < 64; p++) {
+    let prime = true;
+    for (let d = 2; d * d <= p; d++) if (p % d === 0) { prime = false; break; }
+    if (!prime) continue;
+    if (found < 8) SHA_H0.push(frac(Math.sqrt(p)));
+    SHA_K.push(frac(Math.cbrt(p)));
+    found++;
+  }
+})();
+const ror = (x, n) => (x >>> n) | (x << (32 - n));
+function sha256(data) {
+  const len = data.length, total = ((len + 72) >> 6) << 6;
+  const buf = new Uint8Array(total), dv = new DataView(buf.buffer), w = new Int32Array(64), H = SHA_H0.slice();
+  buf.set(data);
+  buf[len] = 0x80;
+  dv.setUint32(total - 8, Math.floor(len / 0x20000000));
+  dv.setUint32(total - 4, (len * 8) >>> 0);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getInt32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const a = w[i - 15], b = w[i - 2];
+      w[i] = (w[i - 16] + (ror(a, 7) ^ ror(a, 18) ^ (a >>> 3)) + w[i - 7] + (ror(b, 17) ^ ror(b, 19) ^ (b >>> 10))) | 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + SHA_K[i] + w[i]) | 0;
+      const t2 = ((ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+    H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  H.forEach((x, i) => ov.setInt32(i * 4, x));
+  return out;
+}
+const utf8 = (s) => new TextEncoder().encode(String(s));
+function hmacHex(key, msg) {
+  let k = utf8(key);
+  if (k.length > 64) k = sha256(k);
+  const m = utf8(msg), inner = new Uint8Array(64 + m.length), outer = new Uint8Array(96);
+  for (let i = 0; i < 64; i++) { inner[i] = (k[i] || 0) ^ 0x36; outer[i] = (k[i] || 0) ^ 0x5c; }
+  inner.set(m, 64);
+  outer.set(sha256(inner), 64);
+  return Array.from(sha256(outer), (x) => x.toString(16).padStart(2, "0")).join("");
+}
+// 증명: 누가(host · guest) · 어느 자리(gid) · 이번 연결의 두 난수. 방향을 넣어 받은 증명을 되돌려 보내도 쓸 수 없다
+const proofFor = (secret, who, gid, gNonce, hNonce) => hmacHex(secret, `holdem|${V}|${who}|${gid}|${gNonce}|${hNonce}`);
 
 // ===== 자리별 화면 (view) =====
 // seat 한 자리에 보내도 되는 것만 담는다: 공개 정보 + 그 자리의 카드 + 공개된(shown) 카드.
@@ -131,14 +191,25 @@ function viewToMatch(v) {
 }
 
 // ===== 손님 → 방장 메시지 검사 =====
-// hello {v, name, token} · act {hand, n, type, to} · ping. 틀리면 null (무시)
+// hello {v, name, gid?, nonce?} (gid: 되찾을 자리, nonce: 이번 연결 난수) · auth {proof} · act {hand, n, type, to} · ping · leave. 틀리면 null (무시)
 function parseGuestMsg(raw) {
   const o = parseJSON(raw, MAX_IN);
   if (!o) return null;
   switch (o.t) {
-    case "hello":
-      if (!isInt(o.v) || typeof o.name !== "string" || o.name.length > 64 || typeof o.token !== "string" || !TOKEN_RE.test(o.token)) return null;
-      return { t: "hello", v: o.v, name: cleanName(o.name), token: o.token };
+    case "hello": {
+      if (!isInt(o.v) || typeof o.name !== "string" || o.name.length > 64) return null;
+      const out = { t: "hello", v: o.v, name: cleanName(o.name), gid: null, nonce: null };
+      if (o.gid !== undefined && o.gid !== null) {
+        if (typeof o.gid !== "string" || !TOKEN_RE.test(o.gid) || typeof o.nonce !== "string" || !TOKEN_RE.test(o.nonce)) return null;
+        out.gid = o.gid;
+        out.nonce = o.nonce;
+      }
+      return out;
+    }
+    case "auth":
+      return typeof o.proof === "string" && PROOF_RE.test(o.proof) ? { t: "auth", proof: o.proof } : null;
+    case "leave":
+      return { t: "leave" };
     case "act": {
       if (!isInt(o.hand) || o.hand < 1 || o.hand > 1e6 || !isInt(o.n) || o.n < 0 || o.n > 10000) return null;
       if (!ACT_TYPES.includes(o.type)) return null;
@@ -243,8 +314,14 @@ function parseHostMsg(raw) {
   const o = parseJSON(raw, MAX_OUT);
   if (!o) return null;
   switch (o.t) {
-    case "welcome":
-      return isInt(o.seat) && o.seat >= 0 && o.seat < 6 ? { t: "welcome", seat: o.seat } : null;
+    case "welcome": {
+      // secret은 처음 앉을 때만 온다 (되찾을 때는 이미 갖고 있다)
+      if (!isInt(o.seat) || o.seat < 0 || o.seat > 5 || typeof o.gid !== "string" || !TOKEN_RE.test(o.gid)) return null;
+      if (o.secret !== undefined && (typeof o.secret !== "string" || !TOKEN_RE.test(o.secret))) return null;
+      return { t: "welcome", seat: o.seat, gid: o.gid, secret: o.secret || null };
+    }
+    case "auth":
+      return typeof o.nonce === "string" && TOKEN_RE.test(o.nonce) && typeof o.proof === "string" && PROOF_RE.test(o.proof) ? { t: "auth", nonce: o.nonce, proof: o.proof } : null;
     case "lobby": {
       if (!isInt(o.seats) || o.seats < 2 || o.seats > 6 || !Array.isArray(o.players) || o.players.length > 6) return null;
       const players = [];
@@ -270,10 +347,11 @@ function parseHostMsg(raw) {
 }
 
 // ===== 방(로비) — 자리 배정 =====
-// room = { n, started, hostName, guests: [{ seat, name, token, conn, connected }] }
+// room = { n, started, hostName, guests: [{ seat, name, gid, secret, conn, connected, lostAt }] }
+// gid = 자리 표시(공개), secret = 그 자리 비밀값 (이 방 방장이 만들어 그 손님에게만 한 번 준다)
 // 방장은 0번, 손님은 들어온 순서대로 1번부터. 빈 자리는 AI
 function createRoom(n, hostName) {
-  return { n, started: false, hostName: cleanName(hostName, "방장"), guests: [] };
+  return { n, started: false, hostName: uniqueName(cleanName(hostName, "방장"), ["나"]), guests: [] };
 }
 
 // 같은 이름이 있으면 뒤에 숫자를 붙인다 (reserved = 이미 쓰는 이름들)
@@ -287,46 +365,54 @@ function uniqueName(name, reserved) {
   return name;
 }
 
-// 손님 입장. 같은 토큰이면 그 자리를 되찾는다. 결과: {ok, seat, back, replaced} 또는 {ok:false, msg}
+// 손님 입장. hello.gid가 있으면 그 자리를 되찾는다 — gid는 createHost가 서로 확인(auth)을 마친 뒤에만 넘긴다.
+// 결과: {ok, seat, gid, secret(새 자리일 때만), back, replaced} 또는 {ok:false, msg}
 function roomJoin(room, hello, conn, reserved = []) {
-  const g = room.guests.find((x) => x.token === hello.token);
+  const taken = (except) => [...RESERVED, room.hostName, ...reserved, ...room.guests.filter((x) => x !== except).map((x) => x.name)];
+  const g = hello.gid ? room.guests.find((x) => x.gid === hello.gid) : null;
   if (g) {
     const replaced = g.conn !== null && g.conn !== conn ? g.conn : null;
     g.conn = conn;
     g.connected = true;
-    if (!room.started) g.name = uniqueName(cleanName(hello.name, "손님"), [room.hostName, ...reserved, ...room.guests.filter((x) => x !== g).map((x) => x.name)]);
-    return { ok: true, seat: g.seat, back: true, replaced };
+    if (!room.started) g.name = uniqueName(cleanName(hello.name, "손님"), taken(g));
+    return { ok: true, seat: g.seat, gid: g.gid, secret: null, back: true, replaced };
   }
   if (room.started) return { ok: false, msg: "이미 게임이 시작된 방이에요" };
   if (room.guests.length >= room.n - 1) return { ok: false, msg: "자리가 다 찼어요" };
-  const name = uniqueName(cleanName(hello.name, "손님"), [room.hostName, ...reserved, ...room.guests.map((x) => x.name)]);
-  const ng = { seat: room.guests.length + 1, name, token: hello.token, conn, connected: true };
+  const ng = { seat: room.guests.length + 1, name: uniqueName(cleanName(hello.name, "손님"), taken(null)), gid: newToken(12), secret: newToken(24), conn, connected: true, lostAt: 0 };
   room.guests.push(ng);
-  return { ok: true, seat: ng.seat, back: false, replaced: null };
+  return { ok: true, seat: ng.seat, gid: ng.gid, secret: ng.secret, back: false, replaced: null };
 }
 
-// 연결이 끊긴 손님. 시작 전이면 자리에서 빼고 다시 번호를 매긴다. 끊긴 손님의 자리 번호(없으면 -1)
-function roomLeave(room, conn) {
+// 연결이 끊긴 손님: 자리는 남겨 두고(시작 전 로비에서도) 끊긴 것으로 표시한다. 그 손님의 자리 번호(없으면 -1)
+function roomLeave(room, conn, now = Date.now()) {
   const g = room.guests.find((x) => x.conn === conn);
   if (!g) return -1;
-  if (!room.started) {
-    room.guests.splice(room.guests.indexOf(g), 1);
-    room.guests.forEach((x, i) => { x.seat = i + 1; });
-  } else {
-    g.conn = null;
-    g.connected = false;
-  }
+  g.conn = null;
+  g.connected = false;
+  g.lostAt = now;
   return g.seat;
+}
+
+// 시작 전 로비에서 손님을 뺀다 (스스로 나감 · 방장이 내보냄). 뒤 사람들의 자리 번호를 당긴다
+function roomRemove(room, seat) {
+  const i = room.guests.findIndex((x) => x.seat === seat);
+  if (i < 0 || room.started) return false;
+  room.guests.splice(i, 1);
+  room.guests.forEach((x, k) => { x.seat = k + 1; });
+  return true;
 }
 
 const roomGuestAt = (room, seat) => room.guests.find((g) => g.seat === seat) || null;
 
 // ===== 전송: PeerJS (WebRTC) =====
 // URL 파라미터로 시그널링 서버를 바꿀 수 있다 (테스트용): ?peerHost=&peerPort=&peerPath=&peerSecure=0|1
-// 그 밖에는 PeerJS 기본값(공개 서버 · Google STUN · PeerJS TURN)을 그대로 쓴다
-function peerOptions(params) {
+// 이 파라미터는 페이지를 localhost · 127.0.0.1에서 열었을 때만 쓴다. 진짜 사이트에서는 조작한 링크로
+// 엉뚱한 시그널링 서버(가운데서 엿보는 중계)에 붙지 않도록 무시하고 PeerJS 기본값(공개 서버 · Google STUN · PeerJS TURN)을 쓴다
+const isLocalHost = (hostname) => LOCAL_HOSTS.includes(String(hostname || ""));
+function peerOptions(params, hostname = root.location && root.location.hostname) {
   const o = { debug: 0 };
-  const host = params && params.get("peerHost");
+  const host = params && isLocalHost(hostname) && params.get("peerHost");
   if (host) {
     o.host = host;
     o.secure = params.get("peerSecure") !== "0";
@@ -339,27 +425,40 @@ function peerOptions(params) {
 const PEER_NET_ERR = ["network", "server-error", "socket-error", "socket-closed", "disconnected"];
 
 // 방장 쪽 PeerJS. h: onReady() · onOpen(id) · onData(id, str) · onClose(id) · onError(code) · onStatus(state)
+// 서버 등록 토큰은 Peer마다 새로 (PeerJS 기본값). 예전 토큰을 다시 쓰면 서버가 아직 들고 있는 예전 등록에 조용히 다시 붙어
+// 'open'이 오지 않고 멈춘다. 새 토큰이면 예전 등록이 남아 있는 동안 'id-taken'이 오고, 부르는 쪽이 잠시 뒤 다시 연다
 function peerHost(code, opts, h) {
   const Peer = root.Peer;
-  let peer = null, dead = false, rtimer = 0, backoff = 1000, everOpen = false;
+  let peer = null, dead = false, rtimer = 0, wtimer = 0, backoff = 1000, everOpen = false;
   const conns = new Map();
   function reconnectLater() {
     clearTimeout(rtimer);
     if (dead) return;
     rtimer = setTimeout(() => {
       if (dead || !peer || peer.destroyed) return;
-      if (peer.disconnected) { try { peer.reconnect(); } catch (e) { /* 다음에 다시 */ } }
+      if (peer.disconnected) {
+        try { peer.reconnect(); } catch (e) { /* 다음에 다시 */ }
+        // 같은 Peer의 reconnect()는 같은 토큰을 쓴다: 서버가 예전 소켓을 아직 들고 있으면 'open' 없이 다시 붙는다.
+        // 몇 초 동안 다시 끊기지 않으면 붙은 것으로 본다
+        clearTimeout(wtimer);
+        wtimer = setTimeout(() => {
+          if (dead || !peer || peer.destroyed || peer.disconnected) return;
+          clearTimeout(rtimer);
+          backoff = 1000;
+          h.onStatus("online");
+        }, 6000);
+      }
       backoff = Math.min(backoff * 2, 15000);
       reconnectLater();
     }, backoff);
   }
   function start() {
     if (typeof Peer !== "function") { h.onError("unsupported"); return; }
-    const o = Object.assign(peerOptions(opts.params), opts.peerToken ? { token: opts.peerToken } : {});
-    peer = new Peer(ID_PREFIX + code, o);
+    peer = new Peer(ID_PREFIX + code, peerOptions(opts.params));
     peer.on("open", () => {
       everOpen = true;
       clearTimeout(rtimer);
+      clearTimeout(wtimer);
       backoff = 1000;
       h.onStatus("online");
       h.onReady();
@@ -383,6 +482,7 @@ function peerHost(code, opts, h) {
     // (처음 열 때 실패한 것은 onError로 알리고, 다시 여는 것은 부르는 쪽이 정한다)
     peer.on("disconnected", () => {
       if (dead) return;
+      clearTimeout(wtimer);
       h.onStatus("offline");
       if (everOpen) reconnectLater();
     });
@@ -411,6 +511,7 @@ function peerHost(code, opts, h) {
     close() {
       dead = true;
       clearTimeout(rtimer);
+      clearTimeout(wtimer);
       for (const c of conns.values()) { try { c.close(); } catch (e) { /* 무시 */ } }
       conns.clear();
       if (peer) { try { peer.destroy(); } catch (e) { /* 무시 */ } }
@@ -546,16 +647,54 @@ const hostLink = (kind) => (kind === "local" ? bcHost : peerHost);
 const guestLink = (kind) => (kind === "local" ? bcGuest : peerGuest);
 
 // ===== 방장 서버 =====
-// opts: { kind, code?, peerToken?, resume, params }
-// h: onReady(code) · onHello(id, msg) · onAct(id, msg) · onLeave(id) · onError(code) · onStatus(state)
+// opts: { kind, code?, resume, params, maxConns? }
+// h: onReady(code) · lookup(gid) → 그 자리 비밀값 또는 null · onHello(id, {name, gid}) · onAct(id, msg) · onLeave(id, left)
+//    · onError(code) · onStatus(state)
+// 연결 하나의 단계: new(hello를 기다림) → auth(자리를 되찾는 손님: 증명을 기다림) → ok. ok가 되기 전에는 ping에도 답하지 않는다
+// 자리를 되찾을 때: 손님 hello{gid, nonce} → 방장 auth{nonce, proof} (방장이 먼저 증명) → 손님 auth{proof} → onHello
 function createHost(opts, h) {
   let code = opts.code || makeCode(), link = null, tries = 0, stopped = false, lastSweep = Date.now();
-  const peers = new Map(); // id → { seen, hello, times[] }
+  const peers = new Map(); // id → { seen, opened, state, ch, times[] }
+  const maxConns = opts.maxConns || MAX_CONNS;
+  function onMsg(id, p, msg, now) {
+    if (p.state === "ok") {
+      p.seen = now;
+      if (msg.t === "ping") send(id, { t: "pong" });
+      else if (msg.t === "act") h.onAct(id, msg);
+      else if (msg.t === "leave") drop(id, null, true);
+      return;
+    }
+    if (msg.t === "hello" && p.state === "new") {
+      if (msg.v !== V) { drop(id, { t: "error", msg: "게임 버전이 달라요. 페이지를 새로고침해 주세요", fatal: true }); return; }
+      const secret = msg.gid ? h.lookup(msg.gid) : null;
+      if (!secret) { // 처음 들어오는 손님 (모르는 자리를 대면 새 손님으로 본다)
+        p.state = "ok";
+        p.seen = now;
+        h.onHello(id, { name: msg.name, gid: null });
+        return;
+      }
+      const hn = newToken(16);
+      p.state = "auth";
+      p.ch = { gid: msg.gid, gn: msg.nonce, hn, secret, name: msg.name };
+      send(id, { t: "auth", nonce: hn, proof: proofFor(secret, "host", msg.gid, msg.nonce, hn) });
+    } else if (msg.t === "auth" && p.state === "auth") {
+      const c = p.ch;
+      p.ch = null;
+      if (msg.proof !== proofFor(c.secret, "guest", c.gid, c.gn, c.hn)) { drop(id); return; }
+      p.state = "ok";
+      p.seen = now;
+      h.onHello(id, { name: c.name, gid: c.gid });
+    }
+  }
   function start() {
     link = hostLink(opts.kind)(code, opts, {
       onReady() { if (!stopped) h.onReady(code); },
       onStatus(st) { if (!stopped) h.onStatus(st); },
-      onOpen(id) { peers.set(id, { seen: Date.now(), hello: false, times: [] }); },
+      onOpen(id) {
+        if (stopped || peers.size >= maxConns) { link.drop(id); return; } // 한꺼번에 너무 많은 연결은 받지 않는다
+        const now = Date.now();
+        peers.set(id, { seen: now, opened: now, state: "new", ch: null, times: [] });
+      },
       onData(id, d) {
         const p = peers.get(id);
         if (!p || stopped) return;
@@ -565,13 +704,9 @@ function createHost(opts, h) {
         while (p.times.length && now - p.times[0] > 5000) p.times.shift();
         if (p.times.length > 60) { drop(id); return; }
         const msg = parseGuestMsg(d);
-        if (!msg) return;
-        p.seen = now;
-        if (msg.t === "ping") send(id, { t: "pong" });
-        else if (msg.t === "hello") { if (!p.hello) { p.hello = true; h.onHello(id, msg); } }
-        else if (msg.t === "act" && p.hello) h.onAct(id, msg);
+        if (msg) onMsg(id, p, msg, now);
       },
-      onClose(id) { if (peers.delete(id) && !stopped) h.onLeave(id); },
+      onClose(id) { if (peers.delete(id) && !stopped) h.onLeave(id, false); },
       onError(c) {
         if (stopped) return;
         if (c === "id-taken" && !opts.resume && tries++ < 6) { // 코드가 겹쳤다: 다른 코드로
@@ -585,28 +720,32 @@ function createHost(opts, h) {
     });
     link.start();
   }
-  // 소식이 끊긴 손님 정리. 이 탭이 잠들어 있었다면(타이머가 밀림) 이번엔 봐준다
+  // 소식이 끊긴 손님 · 확인을 마치지 못한 연결 정리. 이 탭이 잠들어 있었다면(타이머가 밀림) 이번엔 봐준다
   const sweep = setInterval(() => {
     const now = Date.now();
-    if (now - lastSweep > PING_MS * 2) for (const p of peers.values()) p.seen = now;
+    if (now - lastSweep > PING_MS * 2) for (const p of peers.values()) { p.seen = now; p.opened = now; }
     lastSweep = now;
-    for (const [id, p] of peers) if (now - p.seen > DEAD_MS) drop(id);
+    for (const [id, p] of peers) {
+      if (p.state === "ok" ? now - p.seen > DEAD_MS : now - p.opened > HELLO_MS) drop(id);
+    }
   }, 1000);
   function send(id, obj) {
     if (!stopped && link) link.send(id, JSON.stringify(obj));
   }
-  function drop(id, last) {
+  // left: 손님이 스스로 나갔다 (leave)
+  function drop(id, last, left) {
     if (!peers.has(id)) return;
     peers.delete(id);
     if (last) send(id, last);
     setTimeout(() => link && link.drop(id), last ? 400 : 0); // 마지막 메시지가 나갈 틈을 준다
-    if (!stopped) h.onLeave(id);
+    if (!stopped) h.onLeave(id, !!left);
   }
   start();
   return {
     get code() { return code; },
-    send, drop,
-    wake() { const now = Date.now(); lastSweep = now; for (const p of peers.values()) p.seen = now; },
+    get conns() { return peers.size; },
+    send, drop: (id, last) => drop(id, last),
+    wake() { const now = Date.now(); lastSweep = now; for (const p of peers.values()) { p.seen = now; p.opened = now; } },
     close(reason) {
       if (stopped) return;
       for (const id of peers.keys()) send(id, { t: "bye", reason: reason || "closed" });
@@ -620,29 +759,32 @@ function createHost(opts, h) {
 }
 
 // ===== 손님 클라이언트 =====
-// opts: { kind, code, name, token, persistent, params, giveUpMs }
-// h: onWelcome(seat) · onLobby(msg) · onState(view) · onError(msg, fatal) · onBye(reason) · onStatus(state, code) · onFatal(code)
+// opts: { kind, code, name, cred: {gid, secret} | null (이 방에서 받은 자리), persistent, params, giveUpMs }
+// h: onWelcome(seat) · onCred({gid, secret}) · onLobby(msg) · onState(view) · onError(msg, fatal) · onBye(reason)
+//    · onStatus(state, code) · onFatal(code)
+// 자리를 되찾을 때는 비밀값을 보내지 않는다: 방장이 먼저 증명(auth)해야 내 증명을 보낸다. 증명이 틀리면 다른 곳(가짜 방장)이므로
+// 그 연결을 버리고 다시 붙는다. welcome을 받기 전에는 lobby · state를 믿지 않는다
 // 끊기면 알아서 다시 붙는다 (persistent가 아니면 처음 연결에서 방을 못 찾았을 때는 바로 포기)
 function createClient(opts, h) {
   let link = null, stopped = false, opened = false, ever = false, lastHeard = 0, lastTick = Date.now();
-  let retry = 0, lostAt = 0, attempt = 0;
+  let retry = 0, lostAt = 0, attempt = 0, cred = opts.cred || null, nonce = "", welcomed = false, proved = false;
   function connect() {
     if (stopped) return;
     if (link) link.close();
     const me = guestLink(opts.kind)(opts.code, opts, {
       onOpen() {
         if (link !== me || stopped) return;
-        opened = ever = true;
-        lostAt = 0;
-        attempt = 0;
+        opened = true;
+        welcomed = proved = false;
         lastHeard = Date.now();
-        h.onStatus("open");
-        sendRaw({ t: "hello", v: V, name: opts.name, token: opts.token });
+        nonce = cred ? newToken(16) : "";
+        sendRaw(cred ? { t: "hello", v: V, name: opts.name, gid: cred.gid, nonce } : { t: "hello", v: V, name: opts.name });
       },
       onData(d) {
         if (link !== me || stopped) return;
         const msg = parseHostMsg(d);
         if (!msg) return;
+        if (!welcomed && !["auth", "welcome", "error", "bye"].includes(msg.t)) return; // 확인 전에는 화면을 받지 않는다
         lastHeard = Date.now();
         dispatch(msg);
       },
@@ -654,7 +796,7 @@ function createClient(opts, h) {
   }
   function lost(c) {
     if (stopped) return;
-    opened = false;
+    opened = welcomed = false;
     if (link) { link.close(); link = null; }
     if (c === "unsupported") { stop(); h.onFatal(c); return; }
     if (!ever && !opts.persistent && (c === "not-found" || c === "timeout")) { stop(); h.onFatal(c); return; }
@@ -664,11 +806,29 @@ function createClient(opts, h) {
     if (now - lostAt > limit) { stop(); h.onFatal(ever ? "gone" : c); return; }
     h.onStatus("reconnecting", c);
     clearTimeout(retry);
-    retry = setTimeout(connect, Math.min(1000 + attempt++ * 1000, 5000));
+    // 처음 2분은 자주(방장 새로고침 · 서버 정리), 그 뒤로는 띄엄띄엄 (방장이 오래 걸려 돌아와도 이어지게)
+    retry = setTimeout(connect, now - lostAt < 120000 ? Math.min(1000 + attempt++ * 1000, 5000) : 10000);
   }
   function dispatch(msg) {
     switch (msg.t) {
-      case "welcome": h.onWelcome(msg.seat); break;
+      case "auth":
+        if (!cred || !nonce || proved) return;
+        if (msg.proof !== proofFor(cred.secret, "host", cred.gid, nonce, msg.nonce)) { lost("impostor"); return; }
+        proved = true;
+        sendRaw({ t: "auth", proof: proofFor(cred.secret, "guest", cred.gid, nonce, msg.nonce) });
+        break;
+      case "welcome":
+        if (welcomed) return;
+        if (msg.secret) { // 새 자리 (처음 들어옴, 또는 방장이 예전 자리를 모름)
+          cred = { gid: msg.gid, secret: msg.secret };
+          h.onCred(cred);
+        } else if (!cred || !proved || msg.gid !== cred.gid) return; // 서로 확인하지 않은 '되찾기'는 믿지 않는다
+        welcomed = ever = true;
+        lostAt = 0;
+        attempt = 0;
+        h.onStatus("open");
+        h.onWelcome(msg.seat);
+        break;
       case "lobby": h.onLobby(msg); break;
       case "state": h.onState(msg.view); break;
       case "error":
@@ -692,18 +852,22 @@ function createClient(opts, h) {
     if (now - lastHeard > DEAD_MS) { lost("timeout"); return; }
     sendRaw({ t: "ping" });
   }, PING_MS);
-  function stop() {
+  // leaving: 스스로 나간다 — 방장에게 알리고(시작 전이면 자리를 비운다) 잠깐 뒤 닫는다
+  function stop(leaving) {
+    const l = link, tell = leaving === true && l && opened && welcomed;
+    if (tell) sendRaw({ t: "leave" });
     stopped = true;
-    opened = false;
+    opened = welcomed = false;
     clearTimeout(retry);
     clearInterval(beat);
-    if (link) { link.close(); link = null; }
+    link = null;
+    if (l) { if (tell) setTimeout(() => l.close(), 300); else l.close(); }
   }
   connect();
   return {
     send: sendRaw,
     close: stop,
-    get open() { return opened; },
+    get open() { return opened && welcomed; },
     // 화면이 다시 보일 때: 오래 조용했으면 바로 다시 붙는다
     check() {
       if (stopped) return;
@@ -720,10 +884,10 @@ const supported = (kind) => (kind === "local" ? typeof root.BroadcastChannel ===
   : typeof root.Peer === "function" && typeof root.RTCPeerConnection === "function");
 
 const api = {
-  V, CODE_ALPHA, CODE_LEN, ID_PREFIX, NAME_MAX, MAX_IN, MAX_OUT, PING_MS, DEAD_MS,
-  newToken, makeCode, normCode, cleanName, uniqueName,
+  V, CODE_ALPHA, CODE_LEN, ID_PREFIX, NAME_MAX, MAX_IN, MAX_OUT, PING_MS, DEAD_MS, HELLO_MS, MAX_CONNS, RESERVED,
+  newToken, makeCode, normCode, cleanName, uniqueName, sha256, hmacHex, proofFor, isLocalHost,
   viewFor, viewToMatch, parseGuestMsg, parseHostMsg, checkAct, checkView,
-  createRoom, roomJoin, roomLeave, roomGuestAt,
+  createRoom, roomJoin, roomLeave, roomRemove, roomGuestAt,
   peerOptions, createHost, createClient, supported,
 };
 if (isNode) module.exports = api;

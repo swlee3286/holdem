@@ -393,7 +393,7 @@ async function scenarioC(browser, web) {
   await page.click("[data-count='6']");
   await page.click("#m-start");
   const hands = new Set();
-  let moves = 0, seen = "", seenAt = 0;
+  let moves = 0, seen = "", seenAt = 0, again = 0;
   const t0 = Date.now();
   while (hands.size < HANDS_C && Date.now() - t0 < 4 * 60000 && fails < 20) {
     const s = await page.evaluate(() => ({
@@ -402,19 +402,26 @@ async function scenarioC(browser, web) {
       total: S.m.players.reduce((t, p) => t + p.stack, 0) + (S.m.hand.phase === "done" ? 0 : PokerTable.potTotal(S.m.hand)),
     }));
     ok(s.mode === "solo" && s.total === 12000, `혼자 하기 상태 ${JSON.stringify(s)}`);
-    hands.add(s.no);
-    if (s.modal) { const b = await page.$("#m-watch, #m-again"); if (b) await b.click(); await sleep(200); continue; }
+    hands.add(`${again}|${s.no}`);
+    // 탈락하면 계속 지켜보기(빨리 감기), 매치가 끝나면 다시 하기 (새 매치는 핸드 번호가 1부터라 따로 센다)
+    if (s.modal) {
+      const b = (await page.$("#m-watch")) || (await page.$("#m-again"));
+      if (b) { if ((await b.getAttribute("id")) === "m-again") again++; await b.click(); }
+      await sleep(200);
+      continue;
+    }
     if (s.phase === "bet" && s.toAct === 0 && s.mine) {
       const k = `${s.no}|${s.n}`;
       if (seen !== k) { seen = k; seenAt = Date.now(); }
       else if (Date.now() - seenAt > 450) { await randomMove(page); moves++; }
     } else if (s.phase === "done") {
       await sleep(250);
+      // 탈락 · 우승 창이 1.6초 뒤 그 위에 뜰 수 있다: 그때는 다음 바퀴에서 창부터 처리한다
       const nx = await page.$("#next");
-      if (nx) await nx.click();
+      if (nx && await page.evaluate(() => document.getElementById("modal").hidden)) await nx.click({ timeout: 3000 }).catch(() => {});
     } else if (s.out && !s.fast) {
       const ff = await page.$("#fast");
-      if (ff) await ff.click();
+      if (ff) await ff.click({ timeout: 3000 }).catch(() => {});
     }
     await sleep(120);
   }
