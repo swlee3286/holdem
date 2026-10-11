@@ -1,7 +1,7 @@
 // ===== 효과음 =====
 // 소리 파일 없이 Web Audio로 그때그때 합성한다. 브라우저 자동 재생 제한 때문에 첫 클릭·터치·키 입력 뒤부터 소리가 난다.
 //   PokerSound.play(name)  — deal · flip · check · chip · call · raise · allin · fold · turn · tick · win · bust
-//   PokerSound.setMuted(bool) · isMuted() · toggle()  (음소거 여부는 localStorage에 기억)
+//   PokerSound.setMuted(bool) · isMuted() · toggle()  (음소거 여부는 localStorage에 기억) · probe(name) (테스트용: 화면 밖에서 그려 크기 · 길이)
 // 같은 소리를 60ms 안에 다시 부르면 한 번만 낸다. 다른 탭에 있을 때 · 화면을 누르기 전에는 소리를 내지 않는다(쌓아 두지도 않는다).
 // 브라우저 전역 PokerSound 하나만 만든다.
 (function (root) {
@@ -101,14 +101,15 @@ const SOUNDS = {
   deal: (c) => hiss(c, { f: jitter(3200, 0.1), f2: 1800, q: 0.8, dur: 0.09, g: 0.22 }),
   // 카드를 뒤집는 짧은 두 번의 탁
   flip: (c) => {
-    hiss(c, { f: 2600, q: 1.2, dur: 0.035, g: 0.2 });
-    hiss(c, { f: 1900, q: 1.2, dur: 0.04, g: 0.16, t: 0.06 });
+    hiss(c, { f: 2600, q: 1.2, dur: 0.035, g: 0.55 });
+    hiss(c, { f: 1900, q: 1.2, dur: 0.04, g: 0.45, t: 0.06 });
   },
   // 테이블을 두 번 두드리는 체크
+  // (폰 스피커는 낮은 소리를 잘 못 내서 나무 두드리는 '딱' 소리를 조금 섞는다)
   check: (c) => {
     for (const t of [0, 0.11]) {
-      tone(c, { f: 170, f2: 120, dur: 0.07, type: "triangle", g: 0.45, t });
-      hiss(c, { filter: "lowpass", f: 900, dur: 0.03, g: 0.18, t });
+      tone(c, { f: 240, f2: 160, dur: 0.07, type: "triangle", g: 0.38, t });
+      hiss(c, { f: 1500, q: 1.4, dur: 0.03, g: 0.35, t });
     }
   },
   // 칩 두세 개
@@ -122,14 +123,14 @@ const SOUNDS = {
     for (let i = 0; i < 12; i++) clink(c, 0.03 + i * 0.03 + Math.random() * 0.02, 0.14);
   },
   // 패를 밀어 놓는 부드러운 소리
-  fold: (c) => hiss(c, { filter: "lowpass", f: 1400, f2: 300, dur: 0.18, g: 0.2, attack: 0.02 }),
+  fold: (c) => hiss(c, { filter: "lowpass", f: 1600, f2: 300, dur: 0.18, g: 0.45, attack: 0.02 }),
   // 내 차례: 맑은 두 음
   turn: (c) => {
     tone(c, { f: 659.3, dur: 0.18, g: 0.2 });
     tone(c, { f: 880, dur: 0.28, g: 0.2, t: 0.12 });
   },
   // 시간 경고: 짧은 째깍
-  tick: (c) => tone(c, { f: 1250, dur: 0.03, type: "square", g: 0.06 }),
+  tick: (c) => tone(c, { f: 1250, dur: 0.06, type: "square", g: 0.22 }),
   // 팟을 땄을 때: 올라가는 아르페지오 + 칩
   win: (c) => {
     [523.3, 659.3, 784, 1046.5].forEach((f, i) => tone(c, { f, dur: 0.22, type: "triangle", g: 0.17, t: i * 0.08 }));
@@ -159,9 +160,25 @@ function setMuted(v) {
   if (!muted) unlock();
 }
 
+// 테스트용: 소리 하나를 화면 밖(OfflineAudioContext)에서 그려 최고 크기 · 길이(초)를 돌려준다. 스피커로는 나가지 않는다
+async function probe(name) {
+  const OC = root.OfflineAudioContext || root.webkitOfflineAudioContext;
+  if (!OC || !SOUNDS[name]) return null;
+  const c = new OC(1, 44100 * 2, 44100), keep = [master, noise];
+  master = c.createGain();
+  master.gain.value = 0.55;
+  master.connect(c.destination);
+  noise = null;
+  try { SOUNDS[name](c); } finally { [master, noise] = keep; }
+  const d = (await c.startRendering()).getChannelData(0);
+  let peak = 0, last = 0;
+  for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); if (v > peak) peak = v; if (v > 0.002) last = i; }
+  return { peak: Math.round(peak * 1000) / 1000, dur: Math.round((last / 44100) * 1000) / 1000 };
+}
+
 root.PokerSound = {
   play, setMuted, isMuted: () => muted, toggle: () => { setMuted(!muted); return muted; },
   state: () => (ctx ? ctx.state : "none"), // 오디오 상태 (none: 아직 화면을 누르기 전)
-  names: Object.keys(SOUNDS),
+  names: Object.keys(SOUNDS), probe,
 };
 })(globalThis);

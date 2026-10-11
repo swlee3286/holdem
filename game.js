@@ -79,7 +79,7 @@ const SND = typeof PokerSound === "object" ? PokerSound : null;
 // 그린 뒤마다: 새로 일어난 일만 움직이고 소리 낸다. 창이 열려 있으면 소리만, 빨리 감기 중이면 둘 다 없이
 function fxSync() {
   if (!FX || !S?.m?.hand) return;
-  try { FX.sync({ owner: S, m: S.m, me: ME, quiet: !$("modal").hidden, mute: fast }); } catch {}
+  try { FX.sync({ owner: S, m: S.m, me: ME, quiet: !$("modal").hidden, mute: fast && mode === "solo" }); } catch {}
 }
 function fxCancel(keepSound) {
   try { if (keepSound) FX?.clear(); else FX?.cancel(); } catch {}
@@ -707,7 +707,7 @@ function buildTable(n) {
   const key = `${n}|${shape}|${mode}|${ME}|${names}`;
   if (key === tableKey) return;
   tableKey = key;
-  fxCancel(); // 자리가 옮겨진다: 날아가던 칩 · 카드는 지운다
+  fxCancel(true); // 자리가 옮겨진다: 날아가던 칩 · 카드는 지운다 (이미 일어난 일의 소리는 마저)
   const lay = LAYOUT[shape][n], me = mode === "solo" ? YOU : ME;
   let html = "";
   for (let s = 0; s < n; s++) {
@@ -1114,7 +1114,7 @@ function renderRing(s, t) {
   ring.hidden = !t;
   if (!t) return;
   const plate = ring.parentElement, svg = ring.firstElementChild, rect = svg.firstElementChild;
-  const w = plate.offsetWidth + 12, hh = plate.offsetHeight + 12, r = (hh - 3) / 2;
+  const w = plate.offsetWidth + 10, hh = plate.offsetHeight + 10, r = (hh - 3) / 2;
   const len = 2 * Math.max(0, w - 3 - 2 * r) + 2 * Math.PI * r;
   if (ring.dataset.size !== `${w}x${hh}`) {
     ring.dataset.size = `${w}x${hh}`;
@@ -1440,6 +1440,7 @@ function leaveSolo() {
   stopAll();
   fxCancel();
   S = null;
+  fast = false; // 빨리 감기는 혼자 하기에만 (방장 · 손님 화면으로 넘어가지 않게)
   tableKey = controlsKey = logKey = turnKey = "";
   hint = { key: "", d: null };
 }

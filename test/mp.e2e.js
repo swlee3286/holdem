@@ -5,12 +5,12 @@
 //  A) PeerJS: 방장(넓은 화면) + 손님 2(폰 390x844), 핸드 25개 이상 무작위로 — 모든 화면이 방장과 같은지, 칩 보존,
 //     콘솔 오류 · 멈춤 없음, 차례가 아닌 수 · 늦은 수 무시, 시간 초과, 손님이 창을 닫으면 AI가 대신 → 다시 열면 자리 되찾기,
 //     매치가 끝나면 모두에게 순위 → 다시 하기
-//  B) ?net=local (BroadcastChannel): 같은 브라우저의 탭 2개
+//  B) ?net=local (BroadcastChannel): 같은 브라우저의 탭 2개 — 방장 · 손님 모두 핸드마다 행동에 맞는 소리
 //  C) 혼자 하기 회귀: 6명, 핸드 15개
-//  D) 방장 새로고침: 같은 코드로 다시 열고 하던 핸드를 잇는다, 손님은 알아서 다시 들어온다
+//  D) 방장 새로고침: 같은 코드로 다시 열고 하던 핸드를 잇는다, 손님은 알아서 다시 들어온다 (지난 일의 소리 · 움직임을 다시 틀지 않음)
 //  E) 아티팩트 진입 파일(artifact.html, PeerJS 없음 · window.claude 있음): 친구와 하기를 끄고 GitHub 주소 안내
-//  F) 소리 · 움직임: 행동마다 맞는 소리(핸드별 개수) · 효과가 끝나면 남지 않음 · 새로고침 · 이어하기에 소리 없음 ·
-//     소리 끄기 버튼(40px · aria-pressed · 새로고침해도 기억) · 동작 줄이기에서 움직임 없음
+//  F) 소리 · 움직임: 행동마다 맞는 소리(핸드별 개수) · 효과가 끝나면 남지 않음 · 화면 방향 · 다른 탭에서 효과를 지움 ·
+//     새로고침 · 이어하기에 소리 없음 · 소리 끄기 버튼(40px · aria-pressed · 새로고침해도 기억) · 동작 줄이기에서 움직임 없음
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -93,6 +93,7 @@ function snap(page) {
       online: m.players.map((_, s) => seatOnline(s)),
       away: [...document.querySelectorAll(".seat.away")].map((e) => Number(e.id.slice(5))),
       standings: document.querySelectorAll("#modal-card .standings li").length,
+      fxErr: typeof PokerMotion === "object" ? PokerMotion.stats.errors : -1,
     };
   });
 }
@@ -141,6 +142,7 @@ function makeDriver(N) {
       snaps.push(s);
       if (s.none) continue;
       ok(s.hiddenOk, `${p.page.tag}: 남의 카드가 손님 화면에 있음`);
+      ok(s.fxErr === 0, `${p.page.tag}: 움직임 오류 ${s.fxErr}`);
       if (keyOf(s) === k) {
         st.compared++;
         const same = JSON.stringify(s.board) === JSON.stringify(hs.board) && s.pot === hs.pot && JSON.stringify(s.stacks) === JSON.stringify(hs.stacks) && s.toAct === hs.toAct
@@ -334,7 +336,7 @@ async function scenarioA(browser, web) {
     }
     // 목표 핸드를 채우면 올인 위주로 매치를 끝내고(끝 창 · 다시 하기 확인), 새 매치에서 두 핸드 더
     if (handsPlayed >= HANDS_A && done.silent && !done.again) shove = true;
-    if (done.again && handsPlayed >= againAt + 2 && hs.phase === "done") break;
+    if (done.again && handsPlayed >= Math.max(againAt + 2, HANDS_A) && hs.phase === "done") break; // 매치가 일찍 끝났으면 새 매치에서 목표 핸드까지
     await sleep(120);
   }
   const s = D.st;
@@ -357,6 +359,7 @@ async function scenarioB(browser, web) {
   console.log("B) ?net=local (BroadcastChannel): 탭 2개");
   const base = `http://127.0.0.1:${web.port}/index.html?net=local`;
   const ctx = await browser.newContext(DESKTOP);
+  await ctx.addInitScript(soundHook); // 방장 · 손님 모두 소리 기록
   const host = await newPage(ctx, "Bhost");
   await host.goto(`${base}&nextSec=1`);
   await host.click("#tab-mp");
@@ -383,6 +386,11 @@ async function scenarioB(browser, web) {
   console.log(`   핸드 ${s.hands.size}, 사람 수 ${s.moves}, 화면 비교 ${s.compared} (다름 ${s.mismatch})`);
   ok(s.hands.size >= HANDS_B || s.compared > 20, `local 핸드 수 ${s.hands.size}`);
   ok(s.compared > 20 && s.mismatch === 0, `local 화면 비교 ${s.compared} 다름 ${s.mismatch}`);
+  // 소리: 방장 · 손님 모두 핸드마다 행동 수만큼 (손님은 받은 화면만으로), 끝난 뒤 남은 효과 없음
+  const hh = await checkMpSounds(host, "Bhost"), gh = await checkMpSounds(g, "Bguest");
+  const gs = await g.evaluate(() => ({ fresh: PokerMotion.stats.fresh, played: PokerMotion.stats.played, deal: __snd.filter((x) => x.n === "deal").length, turn: __snd.filter((x) => x.n === "turn").length }));
+  console.log(`   소리 확인: 방장 ${hh}핸드, 손님 ${gh}핸드 ${JSON.stringify(gs)}`);
+  ok(hh >= 3 && gh >= 3 && gs.fresh === 1 && gs.deal > 0 && gs.turn > 0, `local 소리 확인 ${hh}/${gh} ${JSON.stringify(gs)}`);
   await ctx.close();
 }
 
@@ -441,6 +449,7 @@ async function scenarioD(browser, web) {
   await sleep(500);
   const base = `http://127.0.0.1:${web.port}/index.html?peerHost=127.0.0.1&peerPort=${pport}&peerPath=/myapp&peerSecure=0`;
   const hctx = await browser.newContext(DESKTOP);
+  await hctx.addInitScript(soundHook);
   const host = await newPage(hctx, "Dhost");
   await host.goto(`${base}&nextSec=1`);
   await host.click("#tab-mp");
@@ -450,6 +459,7 @@ async function scenarioD(browser, web) {
   await host.click("[data-mpn='3']");
   const code = await host.evaluate(() => room.code);
   const gctx = await browser.newContext(MOBILE);
+  await gctx.addInitScript(soundHook);
   const g = await joinGuest(gctx, base, code, "손님D", "Dguest");
   await host.waitForFunction(() => room.guests.length === 1 && room.guests[0].connected, null, { timeout: 25000 });
   await host.click("#mp-start");
@@ -464,6 +474,7 @@ async function scenarioD(browser, web) {
   }
   ok(before, "새로고침 전 상태");
   if (!before) return;
+  const rebased0 = await g.evaluate(() => PokerMotion.stats.rebased);
   await host.reload();
   const t1 = Date.now();
   await host.waitForFunction(() => mode === "host" && room && room.ready && modalScreen !== "resume", null, { timeout: 30000 });
@@ -473,6 +484,11 @@ async function scenarioD(browser, web) {
   await host.waitForFunction(() => room.guests[0].connected, null, { timeout: 40000 });
   await g.waitForFunction(() => guest.status === "open" && modalScreen === "" && S.m.hand.no >= 1, null, { timeout: 20000 });
   console.log(`   방장 새로고침 → ${((Date.now() - t1) / 1000).toFixed(1)}초 뒤 손님까지 다시 연결`);
+  // 다시 연 방장 · 다시 들어온 손님: 지난 일을 다시 틀지 않는다 (이어 받은 핸드의 카드 나눠 주기 소리 없음, 손님은 기준만 다시 잡음)
+  const hs0 = await host.evaluate((no) => ({ deal: __snd.filter((x) => x.no === no && x.n === "deal").length, anim: __anim }), before.no);
+  const g0 = await g.evaluate(() => PokerMotion.stats.rebased);
+  ok(hs0.deal === 0 && g0 > rebased0, `새로고침 · 다시 연결 뒤 지난 일을 다시 틀지 않음 ${JSON.stringify({ host: hs0, rebased: [rebased0, g0] })}`);
+  const resumedNo = await host.evaluate(() => S.m.hand.no);
   t0 = Date.now();
   const startHands = D.st.hands.size;
   while (Date.now() - t0 < 120000) {
@@ -481,6 +497,8 @@ async function scenarioD(browser, web) {
     await sleep(120);
   }
   ok(D.st.hands.size >= startHands + 2 && D.st.mismatch === 0, `새로고침 뒤 계속 (핸드 ${D.st.hands.size}, 비교 ${D.st.compared}, 다름 ${D.st.mismatch})`);
+  const dh = await checkMpSounds(host, "Dhost", resumedNo + 1), dg = await checkMpSounds(g, "Dguest", resumedNo + 1);
+  ok(dh >= 1 && dg >= 1, `새로고침 뒤 핸드 소리 확인 ${dh}/${dg}`);
   await hctx.close(); await gctx.close();
   if (psServer) psServer.close();
 }
@@ -502,31 +520,36 @@ async function scenarioE(browser, web) {
 }
 
 // ===== F) 소리 · 움직임 =====
-// PokerSound.play를 감싸 어떤 소리가 언제(어느 핸드 · 몇 번째 행동 뒤) 났는지 기록한다 (오디오가 깨어나지 않아도 부른 것은 남는다)
+// PokerSound.play를 감싸 어떤 소리가 어느 매치 · 핸드에서 났는지 기록한다 (오디오가 깨어나지 않아도 부른 것은 남는다).
+// 핸드마다 행동 목록도 0.1초마다 베껴 둔다 (손님은 화면을 받을 때마다 핸드 객체가 바뀐다)
 function soundHook() {
   window.__snd = [];
+  window.__hands = {};
   window.__anim = 0;
   const animate = Element.prototype.animate;
   Element.prototype.animate = function (...a) { window.__anim++; return animate.apply(this, a); };
+  const where = () => { try { return S && S.m && S.m.hand ? { m: S.matchId || "", no: S.m.hand.no } : { m: "", no: 0 }; } catch { return { m: "", no: 0 }; } };
   let real;
   Object.defineProperty(window, "PokerSound", {
     configurable: true,
     get() { return real; },
     set(v) {
       const play = v.play;
-      v.play = (n) => {
-        let no = 0;
-        try { no = S && S.m && S.m.hand ? S.m.hand.no : 0; } catch {}
-        window.__snd.push({ n, no });
-        return play(n);
-      };
+      v.play = (n) => { window.__snd.push({ n, ...where() }); return play(n); };
       real = v;
     },
   });
+  setInterval(() => {
+    try {
+      if (!S || !S.m || !S.m.hand) return;
+      const h = S.m.hand;
+      window.__hands[`${S.matchId || ""}|${h.no}`] = { no: h.no, m: S.matchId || "", me: ME, seats: h.seats.slice(), actions: h.actions.map((a) => ({ seat: a.seat, type: a.type, allin: !!a.allin })) };
+    } catch {}
+  }, 100);
 }
-// 핸드 하나에서 나야 하는 소리 개수 (me = 내 좌석)
-function expectedSounds(h, me, busted) {
-  const e = { deal: 2 * h.seats.length, flip: h.board.length, bust: busted ? 1 : 0 };
+// 핸드 하나에서 행동마다 나야 하는 소리 개수 (me = 내 좌석): 카드 나눠 주기 · 체크 · 벳/블라인드(chip) · 콜 · 레이즈 · 올인 · 폴드 · 내 차례
+function actionSounds(h, me) {
+  const e = { deal: 2 * h.seats.length };
   const add = (k) => { e[k] = (e[k] || 0) + 1; };
   for (const a of h.actions) {
     if (a.type === "return") continue;
@@ -534,12 +557,40 @@ function expectedSounds(h, me, busted) {
     else add(a.type === "sb" || a.type === "bb" || a.type === "bet" ? "chip" : a.type);
     if (a.seat === me && a.type !== "sb" && a.type !== "bb") add("turn"); // 내 차례마다 알림 한 번
   }
+  return e;
+}
+// 혼자 하기: 끝난 핸드 하나의 소리 전부 (팟 · 보드 · 공개 · 탈락까지)
+function expectedSounds(h, me, busted) {
+  const e = { ...actionSounds(h, me), flip: h.board.length, bust: busted ? 1 : 0 };
+  const add = (k) => { e[k] = (e[k] || 0) + 1; };
   const won = h.result.pots.some((p) => p.winners.includes(me));
   if (won) add("win");
   for (let i = 0; i < h.result.pots.length - (won ? 1 : 0); i++) add("chip"); // 팟이 이긴 사람에게 갈 때
   if (h.seats.some((s) => s !== me && !h.folded[s] && h.shown[s])) add("flip"); // 남의 카드 공개
   return e;
 }
+const countBy = (list) => list.reduce((c, x) => ((c[x] = (c[x] || 0) + 1), c), {});
+// 친구와 하기: 끝난 핸드마다 행동 소리가 행동 수와 같은지 (다음 핸드가 1초 뒤 시작해 팟 소리는 잘릴 수 있어 칩은 '이상'만).
+// minNo: 이 핸드부터 (새로고침 · 다시 연결로 중간부터 본 핸드는 뺀다)
+async function checkMpSounds(page, tag, minNo = 0) {
+  const r = await page.evaluate(() => ({ cur: `${S.matchId || ""}|${S.m.hand.no}`, hands: __hands, snd: __snd }));
+  let hands = 0;
+  for (const [key, h] of Object.entries(r.hands)) {
+    if (key === r.cur || h.no < minNo) continue;
+    const got = countBy(r.snd.filter((x) => `${x.m}|${x.no}` === key).map((x) => x.n)), exp = actionSounds(h, h.me);
+    const diff = ["deal", "check", "call", "raise", "allin", "fold", "turn"].filter((k) => (exp[k] || 0) !== (got[k] || 0));
+    if ((got.chip || 0) < (exp.chip || 0)) diff.push("chip");
+    ok(!diff.length, `${tag} 핸드 ${h.no} 소리: ${diff.map((k) => `${k} ${got[k] || 0}/${exp[k] || 0}`).join(", ")}`);
+    hands++;
+  }
+  return hands;
+}
+const fxState = (page) => page.evaluate(() => ({
+  fx: document.querySelector(".fx-layer")?.childElementCount || 0, active: PokerMotion.active(),
+  waapi: document.getAnimations().filter((a) => !(a instanceof CSSAnimation) && !(a instanceof CSSTransition)).length,
+  errors: PokerMotion.stats.errors,
+}));
+
 async function scenarioF(browser, web) {
   console.log("F) 소리 · 움직임");
   const base = `http://127.0.0.1:${web.port}/index.html`;
@@ -547,44 +598,75 @@ async function scenarioF(browser, web) {
   await ctx.addInitScript(soundHook);
   const page = await newPage(ctx, "fx");
   await page.goto(base);
-  const btn = () => page.evaluate(() => { const b = document.getElementById("sound"), r = b.getBoundingClientRect(); return { pressed: b.getAttribute("aria-pressed"), label: b.getAttribute("aria-label"), w: r.width, h: r.height, muted: PokerSound.isMuted() }; });
+  const btn = () => page.evaluate(() => { const b = document.getElementById("sound"), r = b.getBoundingClientRect(); return { pressed: b.getAttribute("aria-pressed"), label: b.getAttribute("aria-label"), svg: !!b.querySelector("svg"), w: r.width, h: r.height, muted: PokerSound.isMuted() }; });
   const b0 = await btn();
-  ok(b0.pressed === "true" && b0.label === "소리" && b0.w >= 40 && b0.h >= 40 && !b0.muted, "소리 버튼: 켜짐 · 이름 · 40px " + JSON.stringify(b0));
+  ok(b0.pressed === "true" && b0.label === "소리" && b0.svg && b0.w >= 40 && b0.h >= 40 && !b0.muted, "소리 버튼: 켜짐 · 이름 · 아이콘 · 40px " + JSON.stringify(b0));
+  ok((await page.evaluate(() => __snd.length)) === 0, "첫 화면에 소리 없음");
   await page.click("[data-count='4']");
   await page.click("#m-start");
-  const counts = (list) => list.reduce((c, x) => ((c[x] = (c[x] || 0) + 1), c), {});
-  let checked = 0, moves = 0, seen = "", seenAt = 0, lastDone = 0;
+  let checked = 0, moves = 0, seen = "", seenAt = 0, lastDone = 0, resized = false, hidden = false;
+  const skip = new Set(); // 다른 탭 흉내를 낸 핸드: 예약한 소리를 일부러 지웠다
   const t0 = Date.now();
-  while (checked < 3 && Date.now() - t0 < 120000 && fails < 20) {
+  while (checked < 4 && Date.now() - t0 < 180000 && fails < 20) {
     const s = await page.evaluate(() => ({ no: S.m.hand.no, n: S.m.hand.actions.length, phase: S.m.hand.phase, toAct: S.m.hand.toAct, mine: document.getElementById("controls").classList.contains("mine"), modal: !document.getElementById("modal").hidden }));
     if (s.modal) { const b = (await page.$("#m-watch")) || (await page.$("#m-again")); if (b) await b.click(); await sleep(200); continue; }
     if (s.phase === "bet" && s.toAct === 0 && s.mine) {
       const k = `${s.no}|${s.n}`;
       if (seen !== k) { seen = k; seenAt = Date.now(); } else if (Date.now() - seenAt > 450) { await randomMove(page); moves++; }
-    } else if (s.phase === "done" && lastDone !== s.no) {
-      lastDone = s.no;
-      await sleep(2600); // 팟이 다 날아가고 소리가 다 난 뒤
-      const r = await page.evaluate((no) => ({
-        h: JSON.parse(JSON.stringify(S.m.hand)), out: S.m.players[0].out,
-        snd: __snd.filter((x) => x.no === no).map((x) => x.n),
-        fx: document.querySelector(".fx-layer")?.childElementCount || 0, active: PokerMotion.active(),
-        waapi: document.getAnimations().filter((a) => !(a instanceof CSSAnimation) && !(a instanceof CSSTransition)).length,
-        errors: PokerMotion.stats.errors,
-      }), s.no);
-      const got = counts(r.snd), exp = expectedSounds(r.h, 0, r.out && r.h.start[0] > 0);
-      const diff = Object.keys({ ...exp, ...got }).filter((k) => (exp[k] || 0) !== (got[k] || 0));
-      ok(!diff.length, `핸드 ${s.no} 소리: ${diff.map((k) => `${k} ${got[k] || 0}/${exp[k] || 0}`).join(", ")}`);
-      ok(r.fx === 0 && r.active === 0 && r.waapi === 0 && r.errors === 0, `핸드 ${s.no} 끝난 뒤 남은 효과 ${JSON.stringify({ fx: r.fx, active: r.active, waapi: r.waapi, errors: r.errors })}`);
-      checked++;
-      if (checked < 3) await page.click("#next", { timeout: 3000 }).catch(() => {});
+    } else if (s.phase === "done") {
+      if (lastDone !== s.no) {
+        lastDone = s.no;
+        // 팟이 다 날아가고 예약한 소리가 다 날 때까지 (효과는 진행을 막지 않으므로 기다리는 것은 테스트뿐)
+        await page.waitForFunction(() => PokerMotion.active() === 0, null, { timeout: 8000 }).catch(() => {});
+        await sleep(200);
+        const r = await page.evaluate((no) => ({ h: JSON.parse(JSON.stringify(S.m.hand)), out: S.m.players[0].out, snd: __snd.filter((x) => x.no === no).map((x) => x.n) }), s.no);
+        const got = countBy(r.snd), exp = expectedSounds(r.h, 0, r.out && r.h.start[0] > 0);
+        const diff = Object.keys({ ...exp, ...got }).filter((k) => (exp[k] || 0) !== (got[k] || 0));
+        ok(skip.has(s.no) || !diff.length, `핸드 ${s.no} 소리: ${diff.map((k) => `${k} ${got[k] || 0}/${exp[k] || 0}`).join(", ")}`);
+        const f = await fxState(page);
+        ok(f.fx === 0 && f.active === 0 && f.waapi === 0 && f.errors === 0, `핸드 ${s.no} 끝난 뒤 남은 효과 ${JSON.stringify(f)}`);
+        checked++;
+      }
+      if (checked < 4 && await page.evaluate(() => document.getElementById("modal").hidden)) {
+        const nx = await page.$("#next");
+        if (nx) {
+          await nx.click({ timeout: 3000 }).catch(() => {});
+          // 카드를 나눠 주는 도중 화면 방향이 바뀌면(폰 ↔ 넓은 화면) 떠 있던 효과는 바로 지운다
+          if (!resized && checked === 2) {
+            resized = true;
+            await sleep(150);
+            const mid = await page.evaluate(() => document.querySelector(".fx-layer")?.childElementCount || 0);
+            await page.setViewportSize({ width: 844, height: 390 });
+            await sleep(50);
+            const f = await fxState(page);
+            ok(mid > 0 && f.fx === 0 && f.waapi === 0, `화면 방향이 바뀌면 효과를 지움 (도중 ${mid}개 → ${JSON.stringify(f)})`);
+            await page.setViewportSize({ width: 390, height: 844 });
+          } else if (!hidden && checked === 3) {
+            // 다른 탭으로 가면 떠 있는 효과 · 예약한 소리를 지운다
+            hidden = true;
+            skip.add(await page.evaluate(() => S.m.hand.no));
+            await sleep(120);
+            const hid = await page.evaluate(() => {
+              const before = PokerMotion.active();
+              Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+              document.dispatchEvent(new Event("visibilitychange"));
+              const after = PokerMotion.active();
+              delete document.hidden;
+              return { before, after };
+            });
+            ok(hid.before > 0 && hid.after === 0, "다른 탭으로 가면 효과를 지움 " + JSON.stringify(hid));
+          }
+        }
+      }
     }
     await sleep(100);
   }
   const anim = await page.evaluate(() => __anim);
   console.log(`   핸드 ${checked}, 내 수 ${moves}, 움직임 ${anim}번`);
-  ok(checked >= 3 && anim > 20, `핸드 ${checked} · 움직임 ${anim}`);
+  ok(checked >= 4 && anim > 20 && resized && hidden, `핸드 ${checked} · 움직임 ${anim} · 방향 ${resized} · 탭 ${hidden}`);
   // 새로고침 → 이어하기: 지난 일의 소리 · 움직임 없음
   await page.reload();
+  ok((await page.evaluate(() => __snd.length + __anim)) === 0, "새로고침한 첫 화면에 소리 · 움직임 없음");
   await page.click("#m-resume");
   await sleep(300);
   const after = await page.evaluate(() => ({ snd: __snd.map((x) => x.n), anim: __anim }));
@@ -608,8 +690,8 @@ async function scenarioF(browser, web) {
   await rp.click("#m-start");
   await rp.waitForFunction(() => S.m.hand.phase === "done" || (S.m.hand.toAct === 0 && document.getElementById("controls").classList.contains("mine")), null, { timeout: 30000 });
   await sleep(1200);
-  const rr = await rp.evaluate(() => ({ anim: __anim, snd: __snd.length, fx: document.querySelector(".fx-layer")?.childElementCount || 0 }));
-  ok(rr.anim === 0 && rr.fx === 0 && rr.snd > 0, "동작 줄이기: 움직임 없음 · 소리는 남 " + JSON.stringify(rr));
+  const rr = await rp.evaluate(() => ({ anim: __anim, snd: __snd.length, fx: document.querySelector(".fx-layer")?.childElementCount || 0, css: document.getAnimations().length }));
+  ok(rr.anim === 0 && rr.fx === 0 && rr.css === 0 && rr.snd > 0, "동작 줄이기: 움직임 없음 · 소리는 남 " + JSON.stringify(rr));
   await rctx.close();
 }
 

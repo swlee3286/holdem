@@ -173,7 +173,7 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 /* 시간 제한이 없는 차례(혼자 하기 · AI): 은은하게 숨쉰다. 친구와 하기의 사람 차례는 남은 시간 링 */
 .seat.turn:not(.timed):not(.thinking) .plate { animation: turn-pulse 1.6s ease-in-out infinite; }
 @keyframes turn-pulse { 50% { box-shadow: 0 0 0 7px rgba(209, 171, 94, .13), 0 6px 16px rgba(0, 0, 0, .35); } }
-.ring { position: absolute; left: -7px; top: -7px; pointer-events: none; line-height: 0; } /* 명패 테두리 바깥 (game.js가 크기를 맞춘다) */
+.ring { position: absolute; left: -6px; top: -6px; pointer-events: none; line-height: 0; } /* 명패 테두리 5px 바깥 (game.js가 크기를 맞춘다) */
 .ring svg { display: block; overflow: visible; }
 .ring rect { fill: none; stroke: var(--brass); stroke-width: 3; stroke-linecap: round; transition: stroke-dashoffset .25s linear, stroke .2s; }
 .ring.urgent rect { stroke: var(--down); }
@@ -282,6 +282,9 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 .card.win { transform: translateY(-5px); box-shadow: 0 0 0 2px var(--brass), 0 10px 18px rgba(0, 0, 0, .4); }
 .seat.below .card.win { transform: translateY(5px); }
 .card.dim { filter: brightness(.5) saturate(.6); }
+/* 쇼다운: 카드가 다 펴질 때까지 이긴 카드 표시를 미룬다 (motion.js) */
+#table.fx-hold .card.win { transform: none; box-shadow: 0 1px 0 rgba(0, 0, 0, .25), 0 5px 12px rgba(0, 0, 0, .35); }
+#table.fx-hold #board .card.dim, #table.fx-hold .seat:not(.folded) .card.dim { filter: none; }
 .card.deal { animation: deal .32s cubic-bezier(.2, .8, .3, 1); }
 .card.flip { animation: flip .4s ease-out; }
 @keyframes deal { from { opacity: 0; transform: translateY(-14px) rotate(-4deg) scale(.94); } }
