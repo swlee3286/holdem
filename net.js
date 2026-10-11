@@ -759,8 +759,8 @@ function createHost(opts, h) {
 }
 
 // ===== 손님 클라이언트 =====
-// opts: { kind, code, name, cred: {gid, secret} | null (이 방에서 받은 자리), persistent, params, giveUpMs }
-// h: onWelcome(seat) · onCred({gid, secret}) · onLobby(msg) · onState(view) · onError(msg, fatal) · onBye(reason)
+// opts: { kind, code, name, cred: {gid, secret, started} | null (이 방에서 받은 자리 · 그 방이 시작했는지), persistent, params, giveUpMs }
+// h: onWelcome(seat) · onCred({gid, secret, started}) (저장할 자리 기억이 바뀜) · onLobby(msg) · onState(view) · onError(msg, fatal) · onBye(reason)
 //    · onStatus(state, code) · onFatal(code)
 // 자리를 되찾을 때는 비밀값을 보내지 않는다: 방장이 먼저 증명(auth)해야 내 증명을 보낸다. 증명이 틀리면 다른 곳(가짜 방장)이므로
 // 그 연결을 버리고 다시 붙는다. welcome을 받기 전에는 lobby · state를 믿지 않는다
@@ -819,8 +819,11 @@ function createClient(opts, h) {
         break;
       case "welcome":
         if (welcomed) return;
-        if (msg.secret) { // 새 자리 (처음 들어옴, 또는 방장이 예전 자리를 모름)
-          cred = { gid: msg.gid, secret: msg.secret };
+        if (msg.secret) { // 새 자리 (처음 들어옴, 또는 방장이 예전 자리를 모름 — 시작 전 로비에서 빠졌을 때)
+          // 시작한 방의 진짜 방장은 새 자리를 주지 않는다: 시작한 방의 자리를 되찾으려는데 새 자리를 주면 가짜 방장이다.
+          // 그 화면을 받지 않고, 내 자리 기억도 덮어쓰지 않는다
+          if (cred && cred.started) { lost("impostor"); return; }
+          cred = { gid: msg.gid, secret: msg.secret, started: false };
           h.onCred(cred);
         } else if (!cred || !proved || msg.gid !== cred.gid) return; // 서로 확인하지 않은 '되찾기'는 믿지 않는다
         welcomed = ever = true;
@@ -830,7 +833,10 @@ function createClient(opts, h) {
         h.onWelcome(msg.seat);
         break;
       case "lobby": h.onLobby(msg); break;
-      case "state": h.onState(msg.view); break;
+      case "state":
+        if (cred && !cred.started) { cred.started = true; h.onCred(cred); } // 이 방은 시작했다 (위의 가짜 방장 판별에 쓴다)
+        h.onState(msg.view);
+        break;
       case "error":
         if (msg.fatal) stop();
         h.onError(msg.msg, msg.fatal);

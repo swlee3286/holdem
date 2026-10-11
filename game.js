@@ -1223,7 +1223,7 @@ function loadProfile() {
   const rooms = {};
   if (p.rooms && typeof p.rooms === "object") {
     for (const [code, c] of Object.entries(p.rooms)) {
-      if (c && tokOk(c.gid) && tokOk(c.secret) && Number.isFinite(c.at) && Date.now() - c.at < CRED_MS) rooms[code] = { gid: c.gid, secret: c.secret, at: c.at };
+      if (c && tokOk(c.gid) && tokOk(c.secret) && Number.isFinite(c.at) && Date.now() - c.at < CRED_MS) rooms[code] = { gid: c.gid, secret: c.secret, started: !!c.started, at: c.at };
     }
   }
   return { name: ok ? PokerNet.cleanName(p.name) : "", last, rooms };
@@ -1231,17 +1231,19 @@ function loadProfile() {
 function saveProfile() {
   try { localStorage.setItem(NET_KEY, JSON.stringify(profile)); } catch {}
 }
-// 받은 자리를 기억한다: 이 탭(sessionStorage) + 이 브라우저(localStorage, 창을 닫았다 다시 열 때). 최근 8개 방까지만
+// 받은 자리를 기억한다: 이 탭(sessionStorage) + 이 브라우저(localStorage, 창을 닫았다 다시 열 때). 최근 8개 방까지만.
+// started: 그 방이 시작했다 (시작한 방에서 새 자리를 주는 곳은 가짜 방장 — net.js createClient)
 function saveCred(code, cred) {
-  profile.rooms[code] = { gid: cred.gid, secret: cred.secret, at: Date.now() };
+  const started = !!cred.started;
+  profile.rooms[code] = { gid: cred.gid, secret: cred.secret, started, at: Date.now() };
   for (const c of Object.keys(profile.rooms).sort((a, b) => profile.rooms[b].at - profile.rooms[a].at).slice(8)) delete profile.rooms[c];
   saveProfile();
-  try { sessionStorage.setItem(TAB_KEY, JSON.stringify({ code, gid: cred.gid, secret: cred.secret })); } catch {}
+  try { sessionStorage.setItem(TAB_KEY, JSON.stringify({ code, gid: cred.gid, secret: cred.secret, started })); } catch {}
 }
 function tabCred(code) {
   try {
     const t = JSON.parse(sessionStorage.getItem(TAB_KEY));
-    if (t && t.code === code && tokOk(t.gid) && tokOk(t.secret)) return { gid: t.gid, secret: t.secret };
+    if (t && t.code === code && tokOk(t.gid) && tokOk(t.secret)) return { gid: t.gid, secret: t.secret, started: !!t.started };
   } catch {}
   return null;
 }
@@ -1251,7 +1253,7 @@ async function credFor(code) {
   if (mine) return mine;
   const c = profile.rooms[code];
   if (!c) return null;
-  return (await tabProbe("guest", code, c.gid)) ? null : { gid: c.gid, secret: c.secret };
+  return (await tabProbe("guest", code, c.gid)) ? null : { gid: c.gid, secret: c.secret, started: c.started };
 }
 
 // ===== 같은 브라우저의 다른 탭 =====
@@ -1840,7 +1842,7 @@ function guestJoin(code, name, persistent, cred) {
   startTicker();
   // 방장이 오래(새로고침 · 전화 · 잠깐 멈춤) 걸려 돌아와도 이어지게 방장이 방을 기억하는 시간만큼 다시 시도한다
   net = PokerNet.createClient({ kind: NET_KIND, code, name, cred, persistent, params: QS, giveUpMs: RESUME_MS }, {
-    onCred(c) { // 새 자리를 받았다: 이 방에서만 쓴다
+    onCred(c) { // 새 자리를 받았다 · 방이 시작했다: 이 방에서만 쓴다
       guest.cred = c;
       saveCred(code, c);
     },

@@ -338,7 +338,7 @@ function clientFor(code, cred, name = "손님") {
   const ev = { welcome: [], creds: [], status: [], states: 0, errors: [] };
   const c = N.createClient({ kind: "local", code, name, cred, persistent: true, giveUpMs: 60000 }, {
     onWelcome(seat) { ev.welcome.push(seat); },
-    onCred(x) { ev.creds.push(x); },
+    onCred(x) { ev.creds.push({ ...x }); },
     onLobby() {}, onState() { ev.states++; },
     onError(msg, fatal) { ev.errors.push([msg, fatal]); },
     onBye() {}, onStatus(st, why) { ev.status.push([st, why]); }, onFatal(x) { ev.fatal = x; },
@@ -408,6 +408,24 @@ function clientFor(code, cred, name = "손님") {
     await sleep(400);
     ok(W.ev.welcome.length === 0 && W.ev.states === 0 && !W.c.open, "증명 없는 welcome · 화면은 무시");
     W.c.close(); ch2.close();
+    // 증명 대신 '새 자리'(welcome + secret)를 주는 곳: 시작 전 로비라면 진짜 방장일 수도 있지만(로비에서 빠진 손님),
+    // 시작한 방의 진짜 방장은 새 자리를 주지 않는다 → 시작한 방의 자리를 가진 손님은 받지 않고 자리 기억도 지킨다
+    const code3 = "TESTB3", ch3 = new BroadcastChannel("holdem-net-" + code3);
+    ch3.onmessage = (e) => {
+      const m = e.data;
+      if (m.k === "open") ch3.postMessage({ k: "accept", to: m.from });
+      else if (m.k === "data" && m.to === "host" && JSON.parse(m.d).t === "hello") {
+        for (const o of [{ t: "welcome", seat: 1, gid: "gidFAKE00001", secret: "secretFAKE00000000000001" }, { t: "state", view: fakeView }]) ch3.postMessage({ k: "data", from: "host", to: m.from, d: JSON.stringify(o) });
+      }
+    };
+    const X = clientFor(code3, { ...cred, started: true });
+    ok(await until(() => X.ev.status.some(([st, why]) => st === "reconnecting" && why === "impostor")), "시작한 방에서 새 자리를 주면 가짜 방장");
+    ok(X.ev.welcome.length === 0 && X.ev.states === 0 && X.ev.creds.length === 0 && !X.c.open, "가짜 새 자리 · 화면을 받지 않고 자리 기억을 덮어쓰지 않는다");
+    X.c.close();
+    const Y = clientFor(code3, { ...cred, started: false });
+    ok(await until(() => Y.ev.welcome.length === 1 && Y.ev.states === 1), "시작 전 방: 방장이 모르는 자리면 새 자리를 받는다");
+    ok(Y.ev.creds.length === 2 && Y.ev.creds[0].gid === "gidFAKE00001" && Y.ev.creds[0].started === false && Y.ev.creds[1].started === true, "새 자리 기억 → 화면을 받으면 '시작함'으로 다시 저장 " + JSON.stringify(Y.ev.creds));
+    Y.c.close(); ch3.close();
   }
   // 4) 틀린 손님 증명 · 확인 전 ping · 연결 수 제한
   {

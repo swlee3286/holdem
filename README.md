@@ -70,7 +70,7 @@ GitHub Pages: 저장소 Settings → Pages에서 배포할 브랜치(이 저장�
 ### 친구와 하기 프로토콜 (버전 2, JSON 문자열)
 
 - 처음 앉기: 손님 `hello {v, name}` → 방장 `welcome {seat, gid, secret}`. `gid`는 자리 표시, `secret`은 그 자리 비밀값 (방장이 만들고 이 손님에게 이 한 번만 보낸다). 손님은 방 코드별로 기억한다 (이 탭: sessionStorage, 창을 닫았다 열 때: localStorage)
-- 자리 되찾기: 손님 `hello {v, name, gid, nonce}` → 방장 `auth {nonce, proof}` → 손님은 방장 증명을 확인한 뒤에만 `auth {proof}` → 방장 `welcome {seat, gid}`. 증명 = HMAC-SHA256(secret, 방향 · gid · 두 nonce). 방장 증명이 틀리면 손님은 그 연결을 버리고 다시 붙는다. welcome 전에는 lobby · state를 받지 않는다. 방장이 모르는 gid는 새 손님으로 본다
+- 자리 되찾기: 손님 `hello {v, name, gid, nonce}` → 방장 `auth {nonce, proof}` → 손님은 방장 증명을 확인한 뒤에만 `auth {proof}` → 방장 `welcome {seat, gid}`. 증명 = HMAC-SHA256(secret, 방향 · gid · 두 nonce). 방장 증명이 틀리면 손님은 그 연결을 버리고 다시 붙는다. welcome 전에는 lobby · state를 받지 않는다. 방장이 모르는 gid는 새 손님으로 본다 (시작 전 로비에서 빠진 손님). 진짜 방장은 시작한 뒤에는 새 자리를 주지 않으므로, 시작한 방의 자리를 가진 손님에게 증명 대신 새 자리(secret)를 주는 곳도 가짜 방장으로 보고 자리 기억을 덮어쓰지 않는다
 - 손님 → 방장 (확인 뒤): `act {hand, n, type, to}` (n = 손님이 본 행동 수. 늦거나 차례가 아니거나 규칙에 안 맞으면 무시) · `ping` (3초마다) · `leave` (스스로 나감: 시작 전이면 자리를 비운다)
 - 방장 → 손님: `lobby {code, players, seats, started}` · `state {view}` · `error {msg}` · `pong` · `bye`
 - 방장은 확인(hello · auth)을 마치지 않은 연결에는 답하지 않고 8초 뒤 끊는다. 한꺼번에 받는 연결은 12개까지
