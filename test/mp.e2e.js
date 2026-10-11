@@ -9,6 +9,8 @@
 //  C) 혼자 하기 회귀: 6명, 핸드 15개
 //  D) 방장 새로고침: 같은 코드로 다시 열고 하던 핸드를 잇는다, 손님은 알아서 다시 들어온다
 //  E) 아티팩트 진입 파일(artifact.html, PeerJS 없음 · window.claude 있음): 친구와 하기를 끄고 GitHub 주소 안내
+//  F) 소리 · 움직임: 행동마다 맞는 소리(핸드별 개수) · 효과가 끝나면 남지 않음 · 새로고침 · 이어하기에 소리 없음 ·
+//     소리 끄기 버튼(40px · aria-pressed · 새로고침해도 기억) · 동작 줄이기에서 움직임 없음
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -499,16 +501,129 @@ async function scenarioE(browser, web) {
   await ctx.close();
 }
 
+// ===== F) 소리 · 움직임 =====
+// PokerSound.play를 감싸 어떤 소리가 언제(어느 핸드 · 몇 번째 행동 뒤) 났는지 기록한다 (오디오가 깨어나지 않아도 부른 것은 남는다)
+function soundHook() {
+  window.__snd = [];
+  window.__anim = 0;
+  const animate = Element.prototype.animate;
+  Element.prototype.animate = function (...a) { window.__anim++; return animate.apply(this, a); };
+  let real;
+  Object.defineProperty(window, "PokerSound", {
+    configurable: true,
+    get() { return real; },
+    set(v) {
+      const play = v.play;
+      v.play = (n) => {
+        let no = 0;
+        try { no = S && S.m && S.m.hand ? S.m.hand.no : 0; } catch {}
+        window.__snd.push({ n, no });
+        return play(n);
+      };
+      real = v;
+    },
+  });
+}
+// 핸드 하나에서 나야 하는 소리 개수 (me = 내 좌석)
+function expectedSounds(h, me, busted) {
+  const e = { deal: 2 * h.seats.length, flip: h.board.length, bust: busted ? 1 : 0 };
+  const add = (k) => { e[k] = (e[k] || 0) + 1; };
+  for (const a of h.actions) {
+    if (a.type === "return") continue;
+    if (a.type !== "fold" && a.allin) add("allin");
+    else add(a.type === "sb" || a.type === "bb" || a.type === "bet" ? "chip" : a.type);
+    if (a.seat === me && a.type !== "sb" && a.type !== "bb") add("turn"); // 내 차례마다 알림 한 번
+  }
+  const won = h.result.pots.some((p) => p.winners.includes(me));
+  if (won) add("win");
+  for (let i = 0; i < h.result.pots.length - (won ? 1 : 0); i++) add("chip"); // 팟이 이긴 사람에게 갈 때
+  if (h.seats.some((s) => s !== me && !h.folded[s] && h.shown[s])) add("flip"); // 남의 카드 공개
+  return e;
+}
+async function scenarioF(browser, web) {
+  console.log("F) 소리 · 움직임");
+  const base = `http://127.0.0.1:${web.port}/index.html`;
+  const ctx = await browser.newContext(MOBILE);
+  await ctx.addInitScript(soundHook);
+  const page = await newPage(ctx, "fx");
+  await page.goto(base);
+  const btn = () => page.evaluate(() => { const b = document.getElementById("sound"), r = b.getBoundingClientRect(); return { pressed: b.getAttribute("aria-pressed"), label: b.getAttribute("aria-label"), w: r.width, h: r.height, muted: PokerSound.isMuted() }; });
+  const b0 = await btn();
+  ok(b0.pressed === "true" && b0.label === "소리" && b0.w >= 40 && b0.h >= 40 && !b0.muted, "소리 버튼: 켜짐 · 이름 · 40px " + JSON.stringify(b0));
+  await page.click("[data-count='4']");
+  await page.click("#m-start");
+  const counts = (list) => list.reduce((c, x) => ((c[x] = (c[x] || 0) + 1), c), {});
+  let checked = 0, moves = 0, seen = "", seenAt = 0, lastDone = 0;
+  const t0 = Date.now();
+  while (checked < 3 && Date.now() - t0 < 120000 && fails < 20) {
+    const s = await page.evaluate(() => ({ no: S.m.hand.no, n: S.m.hand.actions.length, phase: S.m.hand.phase, toAct: S.m.hand.toAct, mine: document.getElementById("controls").classList.contains("mine"), modal: !document.getElementById("modal").hidden }));
+    if (s.modal) { const b = (await page.$("#m-watch")) || (await page.$("#m-again")); if (b) await b.click(); await sleep(200); continue; }
+    if (s.phase === "bet" && s.toAct === 0 && s.mine) {
+      const k = `${s.no}|${s.n}`;
+      if (seen !== k) { seen = k; seenAt = Date.now(); } else if (Date.now() - seenAt > 450) { await randomMove(page); moves++; }
+    } else if (s.phase === "done" && lastDone !== s.no) {
+      lastDone = s.no;
+      await sleep(2600); // 팟이 다 날아가고 소리가 다 난 뒤
+      const r = await page.evaluate((no) => ({
+        h: JSON.parse(JSON.stringify(S.m.hand)), out: S.m.players[0].out,
+        snd: __snd.filter((x) => x.no === no).map((x) => x.n),
+        fx: document.querySelector(".fx-layer")?.childElementCount || 0, active: PokerMotion.active(),
+        waapi: document.getAnimations().filter((a) => !(a instanceof CSSAnimation) && !(a instanceof CSSTransition)).length,
+        errors: PokerMotion.stats.errors,
+      }), s.no);
+      const got = counts(r.snd), exp = expectedSounds(r.h, 0, r.out && r.h.start[0] > 0);
+      const diff = Object.keys({ ...exp, ...got }).filter((k) => (exp[k] || 0) !== (got[k] || 0));
+      ok(!diff.length, `핸드 ${s.no} 소리: ${diff.map((k) => `${k} ${got[k] || 0}/${exp[k] || 0}`).join(", ")}`);
+      ok(r.fx === 0 && r.active === 0 && r.waapi === 0 && r.errors === 0, `핸드 ${s.no} 끝난 뒤 남은 효과 ${JSON.stringify({ fx: r.fx, active: r.active, waapi: r.waapi, errors: r.errors })}`);
+      checked++;
+      if (checked < 3) await page.click("#next", { timeout: 3000 }).catch(() => {});
+    }
+    await sleep(100);
+  }
+  const anim = await page.evaluate(() => __anim);
+  console.log(`   핸드 ${checked}, 내 수 ${moves}, 움직임 ${anim}번`);
+  ok(checked >= 3 && anim > 20, `핸드 ${checked} · 움직임 ${anim}`);
+  // 새로고침 → 이어하기: 지난 일의 소리 · 움직임 없음
+  await page.reload();
+  await page.click("#m-resume");
+  await sleep(300);
+  const after = await page.evaluate(() => ({ snd: __snd.map((x) => x.n), anim: __anim }));
+  ok(after.snd.length === 0 && after.anim === 0, "새로고침 · 이어하기에 소리 · 움직임 없음 " + JSON.stringify(after));
+  // 소리 끄기: 누르면 꺼지고, 새로고침해도 꺼진 채
+  await page.click("#sound");
+  ok((await btn()).pressed === "false", "소리 끄기");
+  await page.reload();
+  const b1 = await btn();
+  ok(b1.pressed === "false" && b1.muted, "새로고침 뒤에도 꺼짐 " + JSON.stringify(b1));
+  await page.click("#sound").catch(() => {}); // 창 뒤라 눌리지 않으면 아래에서 직접
+  if ((await btn()).pressed !== "true") await page.evaluate(() => document.getElementById("sound").click());
+  ok((await btn()).pressed === "true", "다시 켜기");
+  await ctx.close();
+  // 동작 줄이기: 움직임 없이 소리만
+  const rctx = await browser.newContext({ ...DESKTOP, reducedMotion: "reduce" });
+  await rctx.addInitScript(soundHook);
+  const rp = await newPage(rctx, "fx-reduce");
+  await rp.goto(base);
+  await rp.click("[data-count='6']");
+  await rp.click("#m-start");
+  await rp.waitForFunction(() => S.m.hand.phase === "done" || (S.m.hand.toAct === 0 && document.getElementById("controls").classList.contains("mine")), null, { timeout: 30000 });
+  await sleep(1200);
+  const rr = await rp.evaluate(() => ({ anim: __anim, snd: __snd.length, fx: document.querySelector(".fx-layer")?.childElementCount || 0 }));
+  ok(rr.anim === 0 && rr.fx === 0 && rr.snd > 0, "동작 줄이기: 움직임 없음 · 소리는 남 " + JSON.stringify(rr));
+  await rctx.close();
+}
+
 (async () => {
   const web = await staticServer();
   const browser = await chromium.launch();
-  const only = process.env.ONLY || "ABCDE";
+  const only = process.env.ONLY || "ABCDEF";
   try {
     if (only.includes("A")) await scenarioA(browser, web);
     if (only.includes("B")) await scenarioB(browser, web);
     if (only.includes("C")) await scenarioC(browser, web);
     if (only.includes("D")) await scenarioD(browser, web);
     if (only.includes("E")) await scenarioE(browser, web);
+    if (only.includes("F")) await scenarioF(browser, web);
   } catch (e) {
     ok(false, "예외: " + (e && e.stack || e));
   }

@@ -2,11 +2,14 @@
 // 소리 파일 없이 Web Audio로 그때그때 합성한다. 브라우저 자동 재생 제한 때문에 첫 클릭·터치·키 입력 뒤부터 소리가 난다.
 //   PokerSound.play(name)  — deal · flip · check · chip · call · raise · allin · fold · turn · tick · win · bust
 //   PokerSound.setMuted(bool) · isMuted() · toggle()  (음소거 여부는 localStorage에 기억)
+// 같은 소리를 60ms 안에 다시 부르면 한 번만 낸다. 다른 탭에 있을 때 · 화면을 누르기 전에는 소리를 내지 않는다(쌓아 두지도 않는다).
 // 브라우저 전역 PokerSound 하나만 만든다.
 (function (root) {
 "use strict";
 const KEY = "holdem-sound";
+const GAP_MS = 60; // 같은 소리 사이 최소 간격
 let ctx = null, master = null, noise = null, muted = false;
+const lastAt = {};
 try { muted = root.localStorage?.getItem(KEY) === "off"; } catch {}
 
 function audio() {
@@ -27,11 +30,22 @@ function audio() {
   return ctx;
 }
 
+// 오디오는 사용자 입력 안에서만 만들고 깨운다 (그 전에 만들면 브라우저가 경고를 남긴다).
+// iOS는 touchend · click에서만 허락하고, 다른 앱을 다녀오면 다시 멈출(interrupted) 수 있어 입력마다 확인한다
 function unlock() {
+  if (muted && !ctx) return;
   const c = audio();
-  if (c && c.state === "suspended") c.resume().catch(() => {});
+  if (!c || c.state === "running") return;
+  c.resume().catch(() => {});
+  // 옛 iOS: 빈 소리를 한 번 내야 풀린다
+  try {
+    const s = c.createBufferSource();
+    s.buffer = c.createBuffer(1, 1, 22050);
+    s.connect(c.destination);
+    s.start(0);
+  } catch {}
 }
-for (const ev of ["pointerdown", "touchstart", "keydown"]) root.addEventListener?.(ev, unlock, { capture: true, passive: true });
+for (const ev of ["pointerdown", "pointerup", "touchend", "click", "keydown"]) root.addEventListener?.(ev, unlock, { capture: true, passive: true });
 
 // 흰 소음 1초 (한 번 만들어 재사용)
 function noiseBuffer(c) {
@@ -131,8 +145,11 @@ const SOUNDS = {
 function play(name) {
   if (muted || !SOUNDS[name]) return;
   if (root.document?.hidden) return; // 다른 탭에 있을 때는 조용히
-  const c = audio();
+  const c = ctx;
   if (!c || c.state !== "running") return; // 아직 화면을 누르기 전: 소리를 쌓아 두지 않는다
+  const now = root.performance ? root.performance.now() : Date.now();
+  if (now - (lastAt[name] ?? -1e9) < GAP_MS) return; // 같은 소리 연타는 한 번만
+  lastAt[name] = now;
   try { SOUNDS[name](c); } catch {}
 }
 
@@ -142,5 +159,9 @@ function setMuted(v) {
   if (!muted) unlock();
 }
 
-root.PokerSound = { play, setMuted, isMuted: () => muted, toggle: () => { setMuted(!muted); return muted; }, names: Object.keys(SOUNDS) };
+root.PokerSound = {
+  play, setMuted, isMuted: () => muted, toggle: () => { setMuted(!muted); return muted; },
+  state: () => (ctx ? ctx.state : "none"), // 오디오 상태 (none: 아직 화면을 누르기 전)
+  names: Object.keys(SOUNDS),
+};
 })(globalThis);

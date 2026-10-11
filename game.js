@@ -1,5 +1,6 @@
 // ===== 설정 =====
-// 2~6인 노리밋 홀덤 화면. 규칙은 table.js(PokerTable), AI는 gto.js(PokerAI), 카드·족보는 engine.js, 온라인은 net.js(PokerNet)
+// 2~6인 노리밋 홀덤 화면. 규칙은 table.js(PokerTable), AI는 gto.js(PokerAI), 카드·족보는 engine.js, 온라인은 net.js(PokerNet),
+// 움직임은 motion.js(PokerMotion), 효과음은 sound.js(PokerSound)
 const SAVE_KEY = "holdem-table-v2";
 const HINT_KEY = "holdem-table-v2-hint";
 const ROOM_KEY = "holdem-room-v1";   // 방장: 방 · 매치 (새로고침하면 같은 코드로 다시 연다)
@@ -61,6 +62,7 @@ let turnKey = "", turnAt = 0; // 내 차례 버튼이 새로 나타난 때: 더�
 const INPUT_LOCK_MS = 350;
 let setup = { n: 6, claude: true, tab: "solo", resume: false, name: "", code: "", link: false, err: "", mpN: 4 }; // 설정 창에서 고른 값 (link: 참가 링크로 들어옴)
 let modalScreen = "";  // 지금 열린 창 이름 (로비처럼 내용만 바꿔 그리는 창)
+let tickKey = "";      // 내 차례 마지막 10초: 초마다 한 번 째깍
 const tallMQ = window.matchMedia("(max-width: 600px)");
 
 const $ = (id) => document.getElementById(id);
@@ -69,6 +71,32 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "
 const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
 const nm = (s) => (s === ME ? "나" : S.m.players[s].name);
 const pct = (a, b) => (b ? `${Math.round((100 * a) / b)}%` : "n/a");
+
+// ===== 소리 · 움직임 =====
+// 둘 다 장식이다: 없거나 실패해도 게임은 그대로. 무엇이 일어났는지는 motion.js가 직전 화면과 비교해서 안다
+const FX = typeof PokerMotion === "object" ? PokerMotion : null;
+const SND = typeof PokerSound === "object" ? PokerSound : null;
+// 그린 뒤마다: 새로 일어난 일만 움직이고 소리 낸다. 창이 열려 있으면 소리만, 빨리 감기 중이면 둘 다 없이
+function fxSync() {
+  if (!FX || !S?.m?.hand) return;
+  try { FX.sync({ owner: S, m: S.m, me: ME, quiet: !$("modal").hidden, mute: fast }); } catch {}
+}
+function fxCancel(keepSound) {
+  try { if (keepSound) FX?.clear(); else FX?.cancel(); } catch {}
+}
+function sound(name) {
+  try { SND?.play(name); } catch {}
+}
+// 위 막대의 소리 켜기/끄기 (켜짐 = aria-pressed true, 기억은 sound.js가 localStorage에)
+function renderSoundBtn() {
+  const b = $("sound");
+  if (!b) return;
+  b.hidden = !SND;
+  if (!SND) return;
+  const on = !SND.isMuted();
+  b.setAttribute("aria-pressed", String(on));
+  b.title = on ? "소리 끄기" : "소리 켜기";
+}
 
 // ===== 친구와 하기: 설정 =====
 // 방장 브라우저가 딜러(진짜 매치)이고, 손님은 자기 자리 화면만 받아 그린다. 전송은 net.js
@@ -136,6 +164,7 @@ function newMatch(n, claudeOn) {
   };
   fast = false;
   tableKey = controlsKey = logKey = turnKey = "";
+  FX?.fresh(); // 첫 핸드도 카드를 나눠 주는 것부터 (이어하기 · 새로고침은 비교 없이 그대로)
   startHand();
 }
 
@@ -579,6 +608,7 @@ function render() {
   renderControls();
   renderLog();
   renderClocks();
+  fxSync();
 }
 
 function renderTop() {
@@ -677,6 +707,7 @@ function buildTable(n) {
   const key = `${n}|${shape}|${mode}|${ME}|${names}`;
   if (key === tableKey) return;
   tableKey = key;
+  fxCancel(); // 자리가 옮겨진다: 날아가던 칩 · 카드는 지운다
   const lay = LAYOUT[shape][n], me = mode === "solo" ? YOU : ME;
   let html = "";
   for (let s = 0; s < n; s++) {
@@ -692,6 +723,7 @@ function buildTable(n) {
           <span class="who"><span class="nm"><b title="${esc(r.name)}">${esc(r.name)}</b><i class="pos" id="pos-${s}"></i></span><span class="stack" id="stack-${s}">${fmt(START_STACK)}</span><span class="away-note" id="away-${s}" hidden><span class="al">연결 끊김 · AI가 대신</span><span class="as">끊김 · AI</span></span></span>
           <span class="dealer" id="dealer-${s}" hidden>D</span>
           <span class="clock" id="clock-${s}" hidden></span>
+          <span class="ring" id="ring-${s}" hidden aria-hidden="true"><svg><rect/></svg></span>
         </div>
         ${s === me ? `<span class="made" id="made"></span>` : ""}
         ${claudeSeat ? `<div class="bubble${lay.bubble ? ` ${lay.bubble}` : x > 60 ? " to-left" : ""}" id="bubble" aria-live="polite"></div>` : ""}
@@ -1052,7 +1084,13 @@ function renderClocks() {
       el.textContent = sec(t.left);
       el.classList.toggle("urgent", t.left <= 10000);
     }
+    renderRing(s, on ? t : null);
   });
+  // 내 차례 마지막 10초: 초마다 째깍 (보낸 수의 답을 기다리는 동안은 조용히)
+  if (t && t.seat === ME && h.toAct === ME && t.left > 0 && t.left <= 10000 && !(mode === "guest" && guest.pending)) {
+    const k = `${S.matchId}|${h.no}|${h.actions.length}|${sec(t.left)}`;
+    if (k !== tickKey) { tickKey = k; sound("tick"); }
+  }
   for (const id of ["my-clock", "wait-clock"]) {
     const el = $(id);
     if (!el) continue;
@@ -1068,6 +1106,28 @@ function renderClocks() {
   }
 }
 
+// 명패 둘레 남은 시간 링 (친구와 하기: 사람 차례). 시계가 없는 차례는 CSS가 은은하게 숨쉬게 한다
+function renderRing(s, t) {
+  const ring = $(`ring-${s}`);
+  if (!ring) return;
+  $(`seat-${s}`).classList.toggle("timed", !!t);
+  ring.hidden = !t;
+  if (!t) return;
+  const plate = ring.parentElement, svg = ring.firstElementChild, rect = svg.firstElementChild;
+  const w = plate.offsetWidth + 12, hh = plate.offsetHeight + 12, r = (hh - 3) / 2;
+  const len = 2 * Math.max(0, w - 3 - 2 * r) + 2 * Math.PI * r;
+  if (ring.dataset.size !== `${w}x${hh}`) {
+    ring.dataset.size = `${w}x${hh}`;
+    svg.setAttribute("width", w);
+    svg.setAttribute("height", hh);
+    svg.setAttribute("viewBox", `0 0 ${w} ${hh}`);
+    for (const [k, v] of [["x", 1.5], ["y", 1.5], ["width", w - 3], ["height", hh - 3], ["rx", r]]) rect.setAttribute(k, v);
+    rect.style.strokeDasharray = len.toFixed(1);
+  }
+  rect.style.strokeDashoffset = (len * (1 - clamp(t.left / (t.total || 1), 0, 1))).toFixed(1);
+  ring.classList.toggle("urgent", t.left <= 10000);
+}
+
 function startTicker() {
   clearInterval(tickTimer);
   tickTimer = setInterval(renderClocks, 250);
@@ -1076,6 +1136,7 @@ function startTicker() {
 // ===== 창 =====
 function openModal(html, screen = "") {
   modalScreen = screen;
+  fxCancel(true); // 창 뒤에서 날아가던 칩 · 카드는 지운다 (진짜 화면은 그대로, 이미 일어난 일의 소리는 마저)
   $("modal-card").innerHTML = html;
   $("modal").hidden = false;
   const card = $("modal-card");
@@ -1377,6 +1438,7 @@ function setupError(msg, focusId) {
 // 혼자 하기 화면에서 나간다 (혼자 하기 매치는 저장돼 있어 처음으로 돌아오면 이어할 수 있다)
 function leaveSolo() {
   stopAll();
+  fxCancel();
   S = null;
   tableKey = controlsKey = logKey = turnKey = "";
   hint = { key: "", d: null };
@@ -1385,6 +1447,7 @@ function leaveSolo() {
 // 친구와 하기를 끝내고 첫 화면으로
 function backToStart(err = "") {
   stopAll();
+  fxCancel();
   clearInterval(tickTimer);
   clearTimeout(pendTimer);
   clearTimeout(retryTimer);
@@ -1712,6 +1775,7 @@ function newMatchMP() {
   fast = false;
   tableKey = controlsKey = logKey = turnKey = "";
   requestWake();
+  FX?.fresh();
   startHand();
 }
 
@@ -1848,6 +1912,7 @@ function guestJoin(code, name, persistent, cred) {
     },
     onWelcome(seat) {
       guest.seat = seat;
+      guest.rebase = true; // 들어옴 · 다시 연결: 다음 화면은 기준만 잡는다
       if (guest.cred) saveCred(code, guest.cred); // 이 탭의 자리로 (다른 탭이 같은 자리를 쓰지 않게)
       if (!S) guestScreen();
     },
@@ -1918,6 +1983,8 @@ function guestState(view) {
     if (guest.cred) saveCred(guest.code, guest.cred); // 자리 기억도 새로 (saveProfile 포함)
     else saveProfile();
   }
+  // 시작을 기다리다 받은 첫 화면 · 끝난 매치 뒤 새 매치(다시 하기)는 카드 나눠 주기부터 보여 준다
+  const fresh = (!S && !!guest.lobby && !guest.lobby.started) || (!!S && S.matchId !== view.match && !!S.m?.over);
   if (!S || S.matchId !== view.match) { // 첫 화면 · 새 매치(다시 하기)
     S = { v: 2, m: null, claudeOn: false, stats: null, history: [], log: [], logAt: null, say: null, biggestPot: 0, doneNo: 0, ended: "", watched: false, matchId: view.match };
     tableKey = controlsKey = logKey = turnKey = "";
@@ -1937,6 +2004,9 @@ function guestState(view) {
       endTimer = setTimeout(showEnd, 1600);
     }
   }
+  if (fresh) FX?.fresh();
+  else if (guest.rebase) FX?.rebase();
+  guest.rebase = false;
   render();
 }
 
@@ -2033,6 +2103,12 @@ document.addEventListener("click", (e) => {
     case "b-raise": userAct("raise", raiseAmount()); return;
     case "skip": thinking?.ctl.abort(); return;
     case "retry": link = "live"; renderTop(); return;
+    case "sound":
+      if (!SND) return;
+      SND.toggle();
+      renderSoundBtn();
+      if (!SND.isMuted()) setTimeout(() => sound("chip"), 90); // 켰다는 확인 (오디오가 깨어날 틈을 조금 준다)
+      return;
     case "tab-solo": case "tab-mp":
       readSetupInputs();
       setup.tab = t.id === "tab-mp" ? "mp" : "solo";
@@ -2183,6 +2259,7 @@ window.addEventListener("pageshow", (e) => { if (e.persisted && mode !== "solo")
 
 // ===== 시작 =====
 function boot() {
+  renderSoundBtn();
   if (netOk()) {
     const code = hashCode();
     if (code) {
