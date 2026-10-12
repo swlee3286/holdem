@@ -208,6 +208,12 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 .tag.allin { background: var(--brass); color: var(--room); }
 .tag.fold { color: var(--muted); }
 .tag.lbl.win { background: var(--brass); color: var(--room); }
+/* 뻥카 도장: 쇼다운에서 들킨 뻥카 (뻥카로 벳하고 끝까지 약한 패. motion.js가 카드가 펴진 뒤 찍는다) */
+.tag.bluff {
+  background: #b5352f; color: #fff4e6; border: 1.5px solid rgba(255, 236, 214, .8);
+  font: 700 12px/1.35 var(--display); letter-spacing: .03em; padding: 1px 8px 0;
+  transform: rotate(-6deg); box-shadow: 0 3px 8px rgba(0, 0, 0, .45);
+}
 .lbl .ls { display: none; }
 .amt {
   display: flex; align-items: center; gap: 5px; white-space: nowrap;
@@ -367,6 +373,9 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 .hint-legend b { color: var(--ink); font: 600 12px var(--mono); }
 .hint-eq { margin-left: auto; }
 .hint-note { font-size: 12px; color: var(--muted); }
+/* 이번 게임 읽기로 옮긴 비율 */
+.hint-read { display: flex; align-items: baseline; gap: 7px; font-size: 12px; color: var(--ink); line-height: 1.4; word-break: keep-all; overflow-wrap: anywhere; }
+.hint-read b { flex: none; font: 600 10.5px var(--body); color: var(--brass); border: 1px solid rgba(209, 171, 94, .45); border-radius: 999px; padding: 0 7px; }
 .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .k-fold { background: #5b6962; }
 .k-check, .k-call { background: #74b38d; }
@@ -411,6 +420,9 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 .street-line { color: var(--ink); }
 .street { font-weight: 600; color: var(--brass); margin-right: 4px; }
 .said { color: var(--clay); }
+.bluff-line { color: #ef9a8c; }
+.bluff-line b { color: inherit !important; }
+.semi-line { opacity: .8; }
 .lc { font-family: var(--mono); font-weight: 600; color: var(--ink); white-space: nowrap; }
 .lc.red { color: #ef7d84; }
 
@@ -457,6 +469,13 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
 .standings li { display: flex; align-items: center; gap: 8px; font-size: 14px; padding: 4px 8px; border-radius: 8px; }
 .standings li.me { background: var(--room); }
 .standings li span:last-child { margin-left: auto; font: 600 13px var(--mono); color: var(--muted); }
+/* 결과 창: AI가 본 나 (이번 게임만) */
+.seen { margin: 0 0 14px; }
+.seen h2 { display: flex; align-items: baseline; gap: 8px; }
+.seen h2 small { font: 500 12px var(--body); color: var(--muted); }
+.modal-card .seen-verdict { margin: 0 0 8px; font-size: 14px; color: var(--clay); }
+.seen-stats { margin: 0; }
+.seen-stats dd small { font: 500 11px var(--body); color: var(--muted); margin-left: 2px; }
 
 /* ===== 친구와 하기 ===== */
 /* 설정 창 맨 위: 혼자 하기 · 친구와 하기 */
@@ -594,7 +613,9 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
   .seat.me .hole { gap: 4px; }
   .made { left: calc(50% + var(--cw-me) + 8px); bottom: calc(100% + 16px); font-size: 11px; padding: 1px 8px; }
   .tag { font-size: 10.5px; padding: 0 7px; }
+  .tag.bluff { font-size: 11px; padding: 0 6px; }
   .bet.fin.up { flex-direction: row; gap: 5px; } /* 위쪽 자리: 끝난 핸드의 족보 · 딴 칩을 한 줄로 (보드와 겹치지 않게) */
+  .bet.fin.up .tag.bluff { position: absolute; bottom: calc(100% + 3px); left: 50%; translate: -50% 0; } /* 뻥카 도장은 그 줄 위에 따로 (옆 자리 결과와 겹치지 않게) */
   .lbl .lf { display: none; }
   .lbl .ls { display: inline; }
   .amt { font-size: 11.5px; gap: 4px; }

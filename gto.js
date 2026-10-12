@@ -1,13 +1,16 @@
 // ===== GTO 근사 포커 AI =====
 // 공개 정보(보드·액션·베팅·스택·포지션·블라인드)와 자기 카드(m.hand.hole[seat])만 쓴다.
 // 다른 좌석의 카드, 덱(m.hand.deck), 이번 핸드 결과(h.result)는 읽지 않는다.
-//   PokerAI.decide(m, seat, {rng}) → { action, to, mix: [{action, to, freq}], info }
+//   PokerAI.decide(m, seat, {rng, reads, names}) → { action, to, mix: [{action, to, freq}], info }
+//     reads(선택): 이번 게임에서 모은 상대 읽기(reads.js PokerReads). 없거나 관련 상대 표본이 없으면 읽기 없이 둔 것과 똑같다
+//     names(선택): info.read 설명에 쓸 자리 이름 배열 (없으면 m.players의 이름)
 //   PokerAI.describeMix(decision) → Claude 프롬프트용 짧은 영어 설명
 // 구성
 //   1) 프리플롭: 포지션별 레인지 차트(표기법 파서) · 숏스택 푸시/폴드 · 스택 깊이별 사이즈
 //   2) 레인지 추적: 이번 핸드의 액션을 같은 모델로 재생해 좌석별 1326 조합 가중치를 갱신 (바닥값으로 0이 되지 않게)
 //   3) 플롭 이후: 레인지 기반 휴리스틱 (MDF, 레인지 우위, 밸류:블러프 비율, SPR)
 //   4) 레인지 상대 승률: 몬테카를로(카드 제거 반영), 리버는 정확 계산
+//   5) 이번 게임 읽기(선택): 상대가 뻥카를 자주 치면 더 넓게 받고, 베팅에 잘 접으면 블러프를 늘린다 (상한이 있는 손잡이 몇 개)
 // 브라우저 전역 PokerAI 하나만 만든다. node에서는 require('./gto.js').
 (function (root) {
 "use strict";
@@ -679,8 +682,8 @@ function postCtx(st, s) {
   };
 }
 
-// 행동하는 좌석의 레인지 전체에 대해 강도·백분위·전략 계획을 계산한다 (공개 정보만)
-function postEval(st, s, board) {
+// 행동하는 좌석의 레인지 전체에 대해 강도·백분위·전략 계획을 계산한다 (공개 정보만). adj: 이번 게임 읽기 손잡이 (없으면 null)
+function postEval(st, s, board, adj = null) {
   const tab = boardTable(board), x = postCtx(st, s), blocked = tab.blocked;
   const opp = new Float64Array(NC);
   for (const o of x.opps) {
@@ -704,7 +707,7 @@ function postEval(st, s, board) {
   }
   x.ra = tw > 0 ? ra / tw : 0.5;
   const p = percentile(e, W, blocked, tw);
-  const plan = postPlan(x, W, e, p, tab, tw);
+  const plan = postPlan(x, W, e, p, tab, tw, adj);
   return { tab, x, e, p, plan };
 }
 
@@ -734,7 +737,7 @@ function betParams(x, wet) {
   return [0.66, 0.3];
 }
 
-function postPlan(x, W, e, p, tab, tw) {
+function postPlan(x, W, e, p, tab, tw, adj) {
   const st = x.street, blocked = tab.blocked, ppot = tab.ppot;
   const P = { facing: x.toCall > 0, street: st, p, ppot, canRaise: x.canRaise };
   const inv = tw > 0 ? 1 / tw : 0;
@@ -761,6 +764,12 @@ function postPlan(x, W, e, p, tab, tw) {
     }
     P.lowSpr = x.effRem - x.toCall < 0.6 * (x.pot + x.toCall);
     P.raiseFrac = 0.6;
+    if (adj) { // 읽기: 베터가 뻥카를 자주 치면 방어 기준·실효 가격을 낮춘다(더 받는다), 거의 안 치면 올린다. 세미블러프 레이즈는 받는 쪽이 잘 접을 때만 늘린다
+      // 팟 오즈 안전장치: 방어 기준 · 가격을 원래의 절반 아래로는 내리지 않는다 (에어로 다 받지 않게)
+      P.thrD = adj.ds > 0 ? Math.max(P.thrD - adj.ds, 0.5 * P.thrD) : Math.min(P.thrD - adj.ds, 1);
+      P.poR = adj.ds > 0 ? Math.max(P.po - adj.ds, 0.5 * P.po) : P.po - adj.ds;
+      P.fr = Math.min(0.7, P.fr * adj.bs);
+    }
     return P;
   }
   // 체크 또는 벳: 레인지 우위로 빈도, 보드 질감으로 크기, alpha = b/(P+2b)로 블러프 비율
@@ -772,11 +781,13 @@ function postPlan(x, W, e, p, tab, tw) {
   if (x.role === "donk") beta = 0.2;
   if (x.k >= 2) { B *= x.k === 2 ? 0.55 : 0.4; beta *= 0.5; }
   B = clamp(B, 0.02, 0.9);
-  const vt = st === 1 ? (size <= 0.4 ? 0.52 : 0.58) : st === 2 ? 0.62 : 0.64;
+  let vt = st === 1 ? (size <= 0.4 ? 0.52 : 0.58) : st === 2 ? 0.62 : 0.64, vcap = B * (1 - beta);
+  if (adj && adj.thin > 0) { vt -= adj.thin; vcap *= 1 + 3 * adj.thin; } // 읽기: 잘 안 접는 상대에게는 밸류를 조금 얇게
   const trap = st === 1 ? (x.ip ? 0.1 : 0.18) : st === 2 ? 0.08 : 0.03;
-  const V = Math.min(B * (1 - beta), mass(vt));
+  const V = Math.min(vcap, mass(vt));
   Object.assign(P, { V, thrV: 1 - V, vt, trap, size, B, beta, jam: x.spr < 1.3 });
-  const Bl = (V * beta) / (1 - beta);
+  let Bl = (V * beta) / (1 - beta);
+  if (adj) Bl *= adj.bs; // 읽기: 블러프 양 = 균형 비율 × (잘 접는 상대 ↑ · 안 접는 상대 ↓)
   let D = 0, A = 0;
   for (let i = 0; i < NC; i++) {
     if (blocked[i]) continue;
@@ -796,6 +807,19 @@ function postPlan(x, W, e, p, tab, tw) {
     const short = B - (V + Math.min(D, Bl) + Math.min(A * P.fa, Math.max(0, Bl - D)));
     if (short > 0 && M > 0) P.fm = Math.min(1, short / M);
   }
+  if (adj && adj.bs > 1) { // 읽기: 잘 접는 상대에게 늘린 블러프 몫이 드로우·에어를 다 쓰고도 남으면 중간 강도 패로 채운다
+    const extra = Bl - (D >= Bl ? Bl : D + A * P.fa);
+    if (extra > 1e-9) {
+      let M = 0;
+      for (let i = 0; i < NC; i++) {
+        if (blocked[i] || e[i] >= vt - 0.04 || ppot[i] >= 0.3) continue;
+        if (st < 3 ? e[i] < 0.3 && ppot[i] < 0.08 : e[i] < 0.25) continue;
+        M += W[i];
+      }
+      M *= inv;
+      if (M > 0) P.fm = Math.min(1, P.fm + extra / M);
+    }
+  }
   return P;
 }
 
@@ -804,7 +828,8 @@ const CP = [0, 0, 0];
 function comboProbs(P, i, e) {
   const p = P.p[i], pp = P.ppot[i];
   if (P.facing) {
-    let cont = e >= 0.93 ? 1 : sig((0.45 * (p - P.thrD) + 0.55 * (e * P.R - P.po)) / 0.05);
+    const po = P.poR === undefined ? P.po : P.poR; // 읽기로 옮긴 실효 가격 (드로우의 직접 오즈는 실제 가격 그대로)
+    let cont = e >= 0.93 ? 1 : sig((0.45 * (p - P.thrD) + 0.55 * (e * P.R - po)) / 0.05);
     // 직접 오즈가 맞는 드로우는 접지 않는다 (레인지 안 순위만 보면 드로우가 약한 메이드 핸드보다 아래로 밀린다)
     if (P.street < 3 && pp >= 0.2 && e * P.R > P.po) cont = Math.max(cont, sig((e * P.R - P.po) / 0.02));
     const vr = P.rvm > 0 && e >= P.rthr - 0.04 ? sig((p - P.thrR) / 0.02) : 0;
@@ -911,6 +936,82 @@ function isNuts(tab, hole) {
   return true;
 }
 
+// ===== 이번 게임 읽기 → 손잡이 =====
+// reads.js의 추정치(bluffy · foldAdj)는 표본이 적으면 GTO 기준값 쪽으로 수축돼 있고(가상 표본) 함께 둔 핸드 수만큼만 믿는다(20핸드에 다 믿음).
+// 그래서 손잡이는 신뢰도만큼만 움직인다. 손잡이마다 상한이 있다
+//   ds  : 베팅을 맞았을 때 방어 기준(MDF)과 실효 가격을 옮기는 양 = 뻥카 지수(−1~1) × 상한
+//         (넓게 받기: 플롭 0.15 · 턴 0.18 · 리버 0.25, 더 접기: 플롭 0.12 · 턴 0.15 · 리버 0.2). 리버 뻥카가 가장 순수한 블러프라 리버를 크게
+//         팟 오즈 안전장치: 방어 기준 · 실효 가격은 원래의 절반 아래로 내리지 않고, 드로우의 직접 오즈 · 넛(절대 폴드 안 함)은 그대로
+//   bs  : 블러프(에어 · 세미블러프) 양에 곱하는 수. 1 + 2.5 × (가장 안 접는 상대의 '폴드 초과분'), 0.4~1.7.
+//         1보다 크면 드로우 · 에어를 다 쓰고 남는 몫은 중간 강도 패로 채운다. 베팅을 맞았을 때의 세미블러프 레이즈에도 곱한다
+//   thin: 잘 안 접는 상대에게 밸류 기준을 낮추는 양 (최대 0.05, 밸류 상한은 1 + 3 × thin 배)
+// 데드존: GTO처럼 두는 상대도 표본 잡음으로 뻥카 지수 ±0.15 · 폴드 초과분 ±0.03 정도는 흔들린다. 그 안쪽은 읽기가 아니라 잡음으로 보고 무시한다
+const READ = { up: [0, 0.15, 0.18, 0.25], down: [0, 0.12, 0.15, 0.2], bsK: 2.5, bsLo: 0.4, bsHi: 1.7, thinK: 0.25, thinMax: 0.05, dzIdx: 0.15, dzFold: 0.03 };
+const deadZone = (v, z) => (v > z ? v - z : v < -z ? v + z : 0);
+let RD = null;
+const readsApi = () => (isNode ? (RD = RD || require("./reads.js")) : root.PokerReads || null);
+
+function readAdj(reads, x, st) {
+  const R = readsApi();
+  if (!R || !reads || !Array.isArray(reads.seats)) return null;
+  // 블러프(세미블러프 레이즈 포함)를 받을 사람들 중 가장 안 접는 사람
+  let foldX = 0, sticky = -1;
+  for (const o of x.opps) {
+    if (st.stack[o] <= 0) continue;
+    const fx = deadZone(R.profile(reads, o).foldAdj, READ.dzFold);
+    if (sticky < 0 || fx < foldX) { foldX = fx; sticky = o; }
+  }
+  const bs = clamp(1 + READ.bsK * foldX, READ.bsLo, READ.bsHi);
+  const thin = x.toCall > 0 ? 0 : clamp(-READ.thinK * foldX, 0, READ.thinMax);
+  let ds = 0, idx = 0, bettor = -1;
+  if (x.toCall > 0) {
+    bettor = st.aggr[x.street];
+    if (bettor >= 0 && bettor !== x.s) {
+      const p = R.profile(reads, bettor);
+      idx = deadZone(x.street === 3 ? p.bluffyRiver : p.bluffy, READ.dzIdx) / (1 - READ.dzIdx);
+      ds = idx * (idx >= 0 ? READ.up : READ.down)[x.street];
+    }
+  }
+  if (ds === 0 && bs === 1 && thin === 0) return null; // 표본이 없으면 손대지 않는다
+  return { ds, bs, thin, idx, foldX, bettor, sticky };
+}
+
+// info.read: 화면 힌트 · Claude 프롬프트에서 설명할 수 있게. names(선택): 설명에 쓸 자리 이름 (예: Claude 프롬프트의 "Human")
+function readInfo(adj, m, names) {
+  const name = (s) => (Array.isArray(names) && typeof names[s] === "string" && names[s]) || (m.players[s] && m.players[s].name) || `Seat ${s}`;
+  const pct = (v) => `${Math.round(Math.abs(v) * 100)}%`;
+  const out = { seat: -1, bettor: -1, sticky: -1, note: "", noteKo: "", defendShift: adj.ds, bluffScale: adj.bs, thin: adj.thin };
+  const en = [], ko = [];
+  // 말의 세기: reads.js 요약(summaryKo)이 '뻥카 잦음 · 잘 안 접음'이라고 부르는 정도(뻥카 지수 ±0.3 · 폴드 초과 ±0.08)부터 단정하고, 그 아래는 '조금'
+  const strongIdx = Math.abs(adj.idx) >= (0.3 - READ.dzIdx) / (1 - READ.dzIdx), strongFold = Math.abs(adj.foldX) >= 0.08 - READ.dzFold;
+  if (adj.ds !== 0) {
+    out.seat = out.bettor = adj.bettor;
+    const b = name(adj.bettor), i = adj.idx.toFixed(2);
+    if (adj.ds > 0) {
+      en.push(`${b} ${strongIdx ? "bets/bluffs more than GTO" : "bets/bluffs a bit more than GTO"} in this game (bluff index ${i}) → defending wider (threshold −${pct(adj.ds)})`);
+      ko.push(strongIdx ? `${b} 뻥카 잦음 → 더 넓게 받음` : `${b} 뻥카가 조금 많음 → 조금 더 넓게 받음`);
+    } else {
+      en.push(`${b} ${strongIdx ? "rarely bluffs" : "bluffs a bit less than GTO"} in this game (bluff index ${i}) → folding more marginal hands (threshold +${pct(adj.ds)})`);
+      ko.push(strongIdx ? `${b} 뻥카 거의 없음 → 애매한 패는 더 접음` : `${b} 뻥카가 조금 적음 → 애매한 패는 조금 더 접음`);
+    }
+  }
+  if (adj.bs !== 1 || adj.thin > 0) {
+    out.sticky = adj.sticky;
+    if (out.seat < 0) out.seat = adj.sticky;
+    const k = name(adj.sticky), who = adj.sticky === out.bettor ? "" : `${k} `; // 같은 사람이면 이름은 한 번만 (화면용)
+    if (adj.bs > 1) {
+      en.push(`${k} ${strongFold ? "over-folds to bets" : "folds to bets a bit more than GTO"} in this game → bluffing ×${adj.bs.toFixed(2)}`);
+      ko.push(strongFold ? `${who}베팅에 잘 접음 → 블러프 늘림` : `${who}베팅에 조금 잘 접음 → 블러프 조금 늘림`);
+    } else {
+      en.push(`${k} ${strongFold ? "rarely folds" : "folds to bets a bit less than GTO"} in this game → bluffing ×${adj.bs.toFixed(2)}${adj.thin > 0 ? ", thinner value bets" : ""}`);
+      ko.push((strongFold ? `${who}잘 안 접음 → 블러프 줄임` : `${who}조금 덜 접음 → 블러프 조금 줄임`) + (adj.thin > 0 ? " · 밸류는 얇게" : ""));
+    }
+  }
+  out.note = en.join("; ");
+  out.noteKo = ko.join(" · ");
+  return out;
+}
+
 // ===== 결정 =====
 const STREET = ["preflop", "flop", "turn", "river"];
 
@@ -993,7 +1094,10 @@ function decideInner(m, seat, opts) {
       { action: "raise", to: S.to, freq: r },
     ];
   } else {
-    const board = h.board, E = postEval(st, seat, board), P = E.plan, x = E.x;
+    let adj = null;
+    if (opts.reads) { try { adj = readAdj(opts.reads, postCtx(st, seat), st); } catch (e) { adj = null; } }
+    const board = h.board, E = postEval(st, seat, board, adj), P = E.plan, x = E.x;
+    if (adj) info.read = readInfo(adj, m, opts.names);
     const ranges = x.opps.map((o) => st.W[o]);
     let eq;
     if (h.street === 3) eq = riverEquity(hole, E.tab, ranges);
@@ -1059,14 +1163,15 @@ function describeMix(d) {
   const hand = i.made ? `${i.handClass}, ${i.made}` : i.handClass;
   let extra = i.mdf != null ? `, MDF ${pct(i.mdf)}` : "";
   if (i.percentile != null) extra += `, own-range percentile ${Math.round(i.percentile * 100)} (100 = strongest)`;
+  const read = i.read && i.read.note ? ` Adjusted by this game's reads: ${i.read.note}.` : "";
   return `GTO engine (${i.position || "?"}, ${i.spot || "?"}, ${hand || "?"}): ${parts.join(", ") || "no suggestion"}. ` +
-    `Equity vs ranges ${pct(i.equity)}, pot odds ${i.potOdds ? pct(i.potOdds) : "-"}${extra}, effective ${Math.round(i.effBB || 0)}bb.`;
+    `Equity vs ranges ${pct(i.equity)}, pot odds ${i.potOdds ? pct(i.potOdds) : "-"}${extra}, effective ${Math.round(i.effBB || 0)}bb.${read}`;
 }
 
 const api = {
   decide, describeMix,
   // 테스트·디버그용
-  _internal: { postEval, preCtx, preStrat, comboProbs, topShare, ownRange, STATS, parseRange, rangePct, RFI, DEF, VS3, VS4, LIMP, CLS_NAME, CLS, comboOf, rankTop, tracked, boardTable, texture, mcEquity },
+  _internal: { postEval, postCtx, readAdj, READ, preCtx, preStrat, comboProbs, topShare, ownRange, STATS, parseRange, rangePct, RFI, DEF, VS3, VS4, LIMP, CLS_NAME, CLS, comboOf, rankTop, tracked, boardTable, texture, mcEquity },
 };
 if (isNode) module.exports = api;
 else root.PokerAI = api;

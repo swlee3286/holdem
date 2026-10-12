@@ -1,6 +1,6 @@
 // ===== 효과음 =====
 // 소리 파일 없이 Web Audio로 그때그때 합성한다. 브라우저 자동 재생 제한 때문에 첫 클릭·터치·키 입력 뒤부터 소리가 난다.
-//   PokerSound.play(name)  — deal · flip · check · chip · call · raise · allin · fold · turn · tick · win · bust
+//   PokerSound.play(name)  — deal · flip · check · chip · call · raise · allin · fold · turn · tick · win · bust · bluff
 //   PokerSound.setMuted(bool) · isMuted() · toggle()  (음소거 여부는 localStorage에 기억) · probe(name) (테스트용: 화면 밖에서 그려 크기 · 길이)
 // 같은 소리를 60ms 안에 다시 부르면 한 번만 낸다. 다른 탭에 있을 때 · 화면을 누르기 전에는 소리를 내지 않는다(쌓아 두지도 않는다).
 // 브라우저 전역 PokerSound 하나만 만든다.
@@ -140,6 +140,13 @@ const SOUNDS = {
   bust: (c) => {
     tone(c, { f: 392, dur: 0.25, type: "triangle", g: 0.18 });
     tone(c, { f: 311.1, dur: 0.4, type: "triangle", g: 0.18, t: 0.2 });
+  },
+  // 뻥카가 드러났을 때: 도장 '탁' + 장난스럽게 '뾰옹' 올라갔다 미끄러져 내려오는 음
+  bluff: (c) => {
+    hiss(c, { f: 900, q: 1.1, dur: 0.06, g: 0.4 });
+    tone(c, { f: 180, f2: 120, dur: 0.08, type: "triangle", g: 0.3 });
+    tone(c, { f: 520, f2: 1040, dur: 0.11, type: "triangle", g: 0.17, t: 0.07 });
+    tone(c, { f: 980, f2: 330, dur: 0.3, type: "triangle", g: 0.15, t: 0.18 });
   },
 };
 
