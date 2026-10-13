@@ -939,14 +939,22 @@ function isNuts(tab, hole) {
 // ===== 이번 게임 읽기 → 손잡이 =====
 // reads.js의 추정치(bluffy · foldAdj)는 표본이 적으면 GTO 기준값 쪽으로 수축돼 있고(가상 표본) 함께 둔 핸드 수만큼만 믿는다(20핸드에 다 믿음).
 // 그래서 손잡이는 신뢰도만큼만 움직인다. 손잡이마다 상한이 있다
-//   ds  : 베팅을 맞았을 때 방어 기준(MDF)과 실효 가격을 옮기는 양 = 뻥카 지수(−1~1) × 상한
+//   ds  : 베팅을 맞았을 때 방어 기준(MDF)과 실효 가격을 옮기는 양 = 뻥카 지수(−1~1, 데드존 밖만) × 상한
 //         (넓게 받기: 플롭 0.15 · 턴 0.18 · 리버 0.25, 더 접기: 플롭 0.12 · 턴 0.15 · 리버 0.2). 리버 뻥카가 가장 순수한 블러프라 리버를 크게
+//         첫 벳에는 bluffyFirst(먼저 벳 빈도 + 공개된 패), 레이즈에는 bluffyShown(공개된 패만). 리버는 리버 지수
 //         팟 오즈 안전장치: 방어 기준 · 실효 가격은 원래의 절반 아래로 내리지 않고, 드로우의 직접 오즈 · 넛(절대 폴드 안 함)은 그대로
+//         다른 사람이 이미 콜했으면 더 넓게 받지 않는다 (베터가 뻥카를 쳐도 콜한 사람을 이겨야 한다)
 //   bs  : 블러프(에어 · 세미블러프) 양에 곱하는 수. 1 + 2.5 × (가장 안 접는 상대의 '폴드 초과분'), 0.4~1.7.
 //         1보다 크면 드로우 · 에어를 다 쓰고 남는 몫은 중간 강도 패로 채운다. 베팅을 맞았을 때의 세미블러프 레이즈에도 곱한다
 //   thin: 잘 안 접는 상대에게 밸류 기준을 낮추는 양 (최대 0.05, 밸류 상한은 1 + 3 × thin 배)
-// 데드존: GTO처럼 두는 상대도 표본 잡음으로 뻥카 지수 ±0.15 · 폴드 초과분 ±0.03 정도는 흔들린다. 그 안쪽은 읽기가 아니라 잡음으로 보고 무시한다
-const READ = { up: [0, 0.15, 0.18, 0.25], down: [0, 0.12, 0.15, 0.2], bsK: 2.5, bsLo: 0.4, bsHi: 1.7, thinK: 0.25, thinMax: 0.05, dzIdx: 0.15, dzFold: 0.03 };
+// 데드존: GTO처럼 두는 상대도 표본 잡음으로 150핸드 뒤 뻥카 지수가 ±0.2 · 폴드 초과분이 ±0.045(표준편차) 정도 흔들린다.
+//   그래서 뻥카 지수는 ±0.45(reads.js 요약이 '뻥카 잦음 · 거의 없음'이라고 부르는 정도) 밖, 폴드 초과분은 ±0.08 밖만 쓴다
+//   (더 좁으면 GTO 상대로 잡음에 반응해 오히려 잃는다: 헤즈업 시드 여러 개에서 3~8bb/100)
+// 설명(info.read)은 바뀐 양이 눈에 띌 때만 (ds 0.02 · 블러프 배수 ±5% · 얇은 밸류 0.01 이상)
+const READ = {
+  up: [0, 0.15, 0.18, 0.25], down: [0, 0.12, 0.15, 0.2], bsK: 2.5, bsLo: 0.4, bsHi: 1.7, thinK: 0.25, thinMax: 0.05, dzIdx: 0.45, dzFold: 0.08,
+  showDs: 0.02, showBs: 0.05, showThin: 0.01,
+};
 const deadZone = (v, z) => (v > z ? v - z : v < -z ? v + z : 0);
 let RD = null;
 const readsApi = () => (isNode ? (RD = RD || require("./reads.js")) : root.PokerReads || null);
@@ -955,56 +963,75 @@ function readAdj(reads, x, st) {
   const R = readsApi();
   if (!R || !reads || !Array.isArray(reads.seats)) return null;
   // 블러프(세미블러프 레이즈 포함)를 받을 사람들 중 가장 안 접는 사람
-  let foldX = 0, sticky = -1;
+  let foldX = 0, sticky = -1, foldAdj = 0;
   for (const o of x.opps) {
     if (st.stack[o] <= 0) continue;
-    const fx = deadZone(R.profile(reads, o).foldAdj, READ.dzFold);
-    if (sticky < 0 || fx < foldX) { foldX = fx; sticky = o; }
+    const fa = R.profile(reads, o).foldAdj, fx = deadZone(fa, READ.dzFold);
+    if (sticky < 0 || fx < foldX) { foldX = fx; sticky = o; foldAdj = fa; }
   }
   const bs = clamp(1 + READ.bsK * foldX, READ.bsLo, READ.bsHi);
   const thin = x.toCall > 0 ? 0 : clamp(-READ.thinK * foldX, 0, READ.thinMax);
-  let ds = 0, idx = 0, bettor = -1;
+  let ds = 0, idx = 0, bettor = -1, why = "";
   if (x.toCall > 0) {
     bettor = st.aggr[x.street];
     if (bettor >= 0 && bettor !== x.s) {
-      const p = R.profile(reads, bettor);
-      idx = deadZone(x.street === 3 ? p.bluffyRiver : p.bluffy, READ.dzIdx) / (1 - READ.dzIdx);
+      const p = R.profile(reads, bettor), raise = x.nBets >= 2, river = x.street === 3;
+      const b = river ? (raise ? p.bluffyRiverShown : p.bluffyRiverFirst) : raise ? p.bluffyShown : p.bluffyFirst;
+      idx = deadZone(b, READ.dzIdx) / (1 - READ.dzIdx);
+      // 설명에 쓸 근거: 요약의 성향 이름과 같은 쪽이면 그대로, 아니면 이번에 쓴 지수의 근거 (리버 · 먼저 벳 빈도 · 공개된 패)
+      why = river ? "river" : Math.sign(deadZone(p.bluffy, READ.dzIdx)) === Math.sign(idx) ? "trait" : raise ? "shown" : "first";
       ds = idx * (idx >= 0 ? READ.up : READ.down)[x.street];
+      // 다른 사람이 이미 이 베팅에 콜했다(올인 콜 포함): 베터의 뻥카로는 더 넓게 받을 이유가 없다
+      if (ds > 0) for (const o of x.opps) {
+        if (o !== bettor && st.acted[o] && (st.bets[o] >= st.maxBet || (st.stack[o] === 0 && st.bets[o] > 0))) { ds = 0; break; }
+      }
     }
   }
   if (ds === 0 && bs === 1 && thin === 0) return null; // 표본이 없으면 손대지 않는다
-  return { ds, bs, thin, idx, foldX, bettor, sticky };
+  return { ds, bs, thin, idx, why, foldX, foldAdj, bettor, sticky };
 }
 
-// info.read: 화면 힌트 · Claude 프롬프트에서 설명할 수 있게. names(선택): 설명에 쓸 자리 이름 (예: Claude 프롬프트의 "Human")
+// info.read: 화면 힌트 · Claude 프롬프트에서 설명할 수 있게. 바뀐 양이 작으면 null (설명하지 않는다)
+// names(선택): 설명에 쓸 자리 이름 (예: Claude 프롬프트의 "Human")
 function readInfo(adj, m, names) {
   const name = (s) => (Array.isArray(names) && typeof names[s] === "string" && names[s]) || (m.players[s] && m.players[s].name) || `Seat ${s}`;
   const pct = (v) => `${Math.round(Math.abs(v) * 100)}%`;
+  const R = readsApi(), traitFold = (R && R._internal && R._internal.TRAIT_FOLD) || 0.12;
+  const showD = Math.abs(adj.ds) >= READ.showDs, showB = Math.abs(adj.bs - 1) >= READ.showBs || adj.thin >= READ.showThin;
+  if (!showD && !showB) return null;
   const out = { seat: -1, bettor: -1, sticky: -1, note: "", noteKo: "", defendShift: adj.ds, bluffScale: adj.bs, thin: adj.thin };
   const en = [], ko = [];
-  // 말의 세기: reads.js 요약(summaryKo)이 '뻥카 잦음 · 잘 안 접음'이라고 부르는 정도(뻥카 지수 ±0.3 · 폴드 초과 ±0.08)부터 단정하고, 그 아래는 '조금'
-  const strongIdx = Math.abs(adj.idx) >= (0.3 - READ.dzIdx) / (1 - READ.dzIdx), strongFold = Math.abs(adj.foldX) >= 0.08 - READ.dzFold;
-  if (adj.ds !== 0) {
+  // 말: 뻥카 지수는 데드존이 요약(summaryKo)의 '뻥카 잦음 · 거의 없음' 기준과 같아 단정한다. 요약과 근거가 다르면 그 근거를 말한다
+  // (리버 지수 · 먼저 벳이 드묾 · 공개된 패). 폴드는 요약이 '베팅에 잘 접음 · 잘 안 접음'이라고 부르는 정도부터 단정하고, 그 아래는 '조금'
+  const strongFold = Math.abs(adj.foldAdj) >= traitFold;
+  if (showD) {
     out.seat = out.bettor = adj.bettor;
-    const b = name(adj.bettor), i = adj.idx.toFixed(2);
-    if (adj.ds > 0) {
-      en.push(`${b} ${strongIdx ? "bets/bluffs more than GTO" : "bets/bluffs a bit more than GTO"} in this game (bluff index ${i}) → defending wider (threshold −${pct(adj.ds)})`);
-      ko.push(strongIdx ? `${b} 뻥카 잦음 → 더 넓게 받음` : `${b} 뻥카가 조금 많음 → 조금 더 넓게 받음`);
+    const b = name(adj.bettor), i = adj.idx.toFixed(2), up = adj.ds > 0;
+    const what = {
+      trait: up ? ["bluffs more than GTO", "뻥카 잦음"] : ["rarely bluffs", "뻥카 거의 없음"],
+      river: up ? ["bluffs more than GTO on the river", "리버 뻥카 잦음"] : ["rarely bluffs on the river", "리버 뻥카 거의 없음"],
+      first: ["rarely bets first, so its bets lean to value", "먼저 벳이 드묾"],
+      shown: ["has shown almost no bluffs", "드러난 뻥카 거의 없음"],
+    }[adj.why] || (up ? ["bluffs more than GTO", "뻥카 잦음"] : ["rarely bluffs", "뻥카 거의 없음"]);
+    if (up) {
+      en.push(`${b} ${what[0]} in this game (bluff index ${i}) → defending wider (threshold −${pct(adj.ds)})`);
+      ko.push(`${b} ${what[1]} → 더 넓게 받음`);
     } else {
-      en.push(`${b} ${strongIdx ? "rarely bluffs" : "bluffs a bit less than GTO"} in this game (bluff index ${i}) → folding more marginal hands (threshold +${pct(adj.ds)})`);
-      ko.push(strongIdx ? `${b} 뻥카 거의 없음 → 애매한 패는 더 접음` : `${b} 뻥카가 조금 적음 → 애매한 패는 조금 더 접음`);
+      en.push(`${b} ${what[0]} in this game (bluff index ${i}) → folding more marginal hands (threshold +${pct(adj.ds)})`);
+      ko.push(`${b} ${what[1]} → 애매한 패는 더 접음`);
     }
   }
-  if (adj.bs !== 1 || adj.thin > 0) {
+  if (showB) {
     out.sticky = adj.sticky;
     if (out.seat < 0) out.seat = adj.sticky;
-    const k = name(adj.sticky), who = adj.sticky === out.bettor ? "" : `${k} `; // 같은 사람이면 이름은 한 번만 (화면용)
+    const k = name(adj.sticky), who = showD && adj.sticky === out.bettor ? "" : `${k} `; // 같은 사람이면 이름은 한 번만 (화면용)
     if (adj.bs > 1) {
       en.push(`${k} ${strongFold ? "over-folds to bets" : "folds to bets a bit more than GTO"} in this game → bluffing ×${adj.bs.toFixed(2)}`);
       ko.push(strongFold ? `${who}베팅에 잘 접음 → 블러프 늘림` : `${who}베팅에 조금 잘 접음 → 블러프 조금 늘림`);
     } else {
-      en.push(`${k} ${strongFold ? "rarely folds" : "folds to bets a bit less than GTO"} in this game → bluffing ×${adj.bs.toFixed(2)}${adj.thin > 0 ? ", thinner value bets" : ""}`);
-      ko.push((strongFold ? `${who}잘 안 접음 → 블러프 줄임` : `${who}조금 덜 접음 → 블러프 조금 줄임`) + (adj.thin > 0 ? " · 밸류는 얇게" : ""));
+      const thin = adj.thin >= READ.showThin;
+      en.push(`${k} ${strongFold ? "rarely folds" : "folds to bets a bit less than GTO"} in this game → bluffing ×${adj.bs.toFixed(2)}${thin ? ", thinner value bets" : ""}`);
+      ko.push((strongFold ? `${who}잘 안 접음 → 블러프 줄임` : `${who}조금 덜 접음 → 블러프 조금 줄임`) + (thin ? " · 밸류는 얇게" : ""));
     }
   }
   out.note = en.join("; ");
@@ -1097,7 +1124,7 @@ function decideInner(m, seat, opts) {
     let adj = null;
     if (opts.reads) { try { adj = readAdj(opts.reads, postCtx(st, seat), st); } catch (e) { adj = null; } }
     const board = h.board, E = postEval(st, seat, board, adj), P = E.plan, x = E.x;
-    if (adj) info.read = readInfo(adj, m, opts.names);
+    if (adj) { const r = readInfo(adj, m, opts.names); if (r) info.read = r; }
     const ranges = x.opps.map((o) => st.W[o]);
     let eq;
     if (h.street === 3) eq = riverEquity(hole, E.tab, ranges);

@@ -315,15 +315,18 @@ function revealedOf(h) {
   }
   return revCache.list;
 }
-// 자리별 뻥카 · 세미블러프 (밸류는 뺀다) → { seat: { bluff: [...], semi: [...], caught } }
-// caught: 쇼다운에서도 여전히 약한 패 = 들킨 뻥카 ('뻥카!' 도장 · 소리). 뻥카 벳 뒤에 맞아서 강해졌으면 기록에만 조용히
+// 자리별 뻥카 · 세미블러프 (밸류는 뺀다) → { seat: { bluff: [...], semi: [...], caught, wonWeak } }
+// caught: 쇼다운에서도 여전히 약한 패로 팟을 못 가져갔다 = 들킨 뻥카 ('뻥카!' 도장 · 소리).
+// wonWeak: 끝까지 약한 패였지만 그래도 이겼다. 둘 다 아니면 뻥카 벳 뒤에 맞았거나 중간 패의 얇은 벳 → 모두 기록에만 조용히
 function bluffsOf(h) {
   const by = {};
   for (const x of revealedOf(h)) {
     if (x.label === "value") continue;
-    const o = (by[x.seat] ||= { bluff: [], semi: [], caught: false });
-    if (x.label === "bluff") { o.bluff.push(x); if (x.weakEnd) o.caught = true; }
-    else o.semi.push(x);
+    const o = (by[x.seat] ||= { bluff: [], semi: [], caught: false, wonWeak: false });
+    if (x.label === "bluff") {
+      o.bluff.push(x);
+      if (x.weakEnd) { if (h.result.won[x.seat] > 0) o.wonWeak = true; else o.caught = true; }
+    } else o.semi.push(x);
   }
   return by;
 }
@@ -469,11 +472,11 @@ const cardsEn = (cs) => cs.map(cardCode).join(" ");
 // 프롬프트에서 부르는 자리 이름
 const whoEn = (s, seat) => (s === seat ? "You (Claude)" : s === YOU ? "Human" : `${S.m.players[s].name} (bot)`);
 
-// 이번 게임 읽기: 이 핸드에 앉은 상대마다 한 줄 (표본 수 포함). 공개 정보만 — 모두가 본 액션과 쇼다운에 공개된 카드.
-// 카드는 사람의 지난 쇼다운(테이블에 공개된 것)만 들어간다
+// 이번 게임 읽기: 이 핸드에 아직 남은 상대마다 한 줄 (표본 수 포함. 이미 접은 상대는 이번 결정과 상관없어 뺀다).
+// 공개 정보만 — 모두가 본 액션과 쇼다운에 공개된 카드. 카드는 사람의 지난 쇼다운(테이블에 공개된 것)만 들어간다
 function readsEn(h, seat, who) {
   const st = S.stats, out = [];
-  const seats = h.seats.filter((s) => s !== seat).sort((a, b) => (h.folded[a] ? 1 : 0) - (h.folded[b] ? 1 : 0));
+  const seats = h.seats.filter((s) => s !== seat && !h.folded[s]);
   for (const s of seats) {
     let line = "";
     try { line = RD && S.reads ? RD.summaryEn(S.reads, s, who(s)) : ""; } catch { line = ""; }
@@ -482,7 +485,6 @@ function readsEn(h, seat, who) {
     try { p = RD && S.reads ? RD.profile(S.reads, s) : null; } catch { p = null; }
     if (p && p.hands) line += ` Preflop: VPIP ${pct(Math.round(p.vpip * p.hands), p.hands)}, PFR ${pct(Math.round(p.pfr * p.hands), p.hands)}.`;
     if (s === YOU && st?.showdowns?.length) line += ` Their recent showdown hands: ${st.showdowns.map((x) => `${x.cards} (${x.hand} on ${x.board})`).join("; ")}.`;
-    if (h.folded[s]) line += " (Already folded this hand.)";
     out.push(`- ${line}`);
   }
   return out.join("\n");
@@ -524,7 +526,7 @@ function buildPrompt(h, seat, L, eng) {
     "",
     `GTO engine advice for exactly this spot: ${mixText(eng.d) || `engine picks ${eng.action}${eng.to ? ` to ${eng.to}` : ""}`}`,
     "",
-    "Reads on your opponents from this game only (they reset when a new game starts). Built only from public information: actions everyone saw, and hole cards only when shown at showdown. Trust them only as far as the sample sizes allow:",
+    "Reads on the opponents still in this hand, from this game only (they reset when a new game starts). Built only from public information: actions everyone saw, and hole cards only when shown at showdown. Trust them only as far as the sample sizes allow:",
     readsEn(h, seat, who),
     "The bot players follow the same GTO engine, which also adapts a little to these reads.",
     "",
@@ -639,15 +641,21 @@ function syncLog() {
       for (const s of h.seats) {
         const b = by[s];
         if (!b) continue;
+        const who = s === ME ? "내" : esc(nm(s)), last = b.bluff[b.bluff.length - 1];
+        const fin = r.hands[s] ? esc(r.hands[s].label) : last ? esc(last.hand) : ""; // 마지막 족보 (쇼다운에 보인 패)
+        const streets = b.bluff.map(betKo).join(" · ");
+        const josa = last && last.type === "bet" ? "은" : "는"; // 벳은 · 레이즈는
         if (b.caught) {
-          const what = `${b.bluff.map(betKo).join(" · ")}, ${esc(b.bluff[b.bluff.length - 1].hand)}`;
-          addLog(`<span class="bluff-line">${s === ME ? `내 뻥카가 들켰어요` : `<b>${esc(nm(s))}</b> 뻥카였어요`} · ${what}</span>`);
-        } else if (b.bluff.length) { // 뻥카로 벳했지만 나중에 맞았다
-          const josa = b.bluff[b.bluff.length - 1].type === "bet" ? "은" : "는"; // 벳은 · 레이즈는
-          addLog(`<span class="semi-line">${s === ME ? "내" : esc(nm(s))} ${b.bluff.map(betKo).join(" · ")}${josa} 뻥카였는데 맞았어요${r.hands[s] ? ` · ${esc(r.hands[s].label)}` : ""}</span>`);
+          addLog(`<span class="bluff-line">${s === ME ? `내 뻥카가 들켰어요` : `<b>${esc(nm(s))}</b> 뻥카였어요`} · ${streets}, ${fin}</span>`);
+        } else if (b.wonWeak) { // 끝까지 약한 패였지만 상대가 더 약했다
+          addLog(`<span class="semi-line">${who} ${streets}${josa} 뻥카였지만 이겼어요 · ${fin}</span>`);
+        } else if (b.bluff.length) {
+          // 뻥카로 벳한 뒤 족보가 올라갔으면 '맞았어요', 아니면 그냥 중간 패로 한 얇은 벳 (상대가 여럿이면 중간 패도 약하게 본다)
+          const up = r.hands[s] && categoryOf(r.hands[s].score) > categoryOf(last.score);
+          addLog(`<span class="semi-line">${who} ${streets}${josa} ${up ? "뻥카였는데 맞았어요" : "얇은 벳이었어요"} · ${fin}</span>`);
         } else if (b.semi.length) {
           const x = b.semi[b.semi.length - 1];
-          addLog(`<span class="semi-line">${esc(nm(s))} 세미블러프 · ${b.semi.map(betKo).join(" · ")}${x.draw ? ` (${DRAW_KO[x.draw]})` : ""}</span>`);
+          addLog(`<span class="semi-line">${who} 세미블러프 · ${b.semi.map(betKo).join(" · ")}${x.draw ? ` (${DRAW_KO[x.draw]})` : ""}</span>`);
         }
       }
     }
@@ -810,7 +818,7 @@ function buildTable(n) {
         ${s === me ? `<span class="made" id="made"></span>` : ""}
         ${claudeSeat ? `<div class="bubble${lay.bubble ? ` ${lay.bubble}` : x > 60 ? " to-left" : ""}" id="bubble" aria-live="polite"></div>` : ""}
       </div>
-      <div class="bet${y < 45 ? " up" : ""}" id="bet-${s}" style="left:${bx}%;top:${by}%"></div>`;
+      <div class="bet${y < 45 ? " up" : ""}${y < 45 && bx === 50 && by < 25 ? " mid" : ""}" id="bet-${s}" style="left:${bx}%;top:${by}%"></div>`;
   }
   $("seats").innerHTML = html;
   const t = $("table");
@@ -875,9 +883,9 @@ function renderSeats() {
   }
 }
 
-// 이번 게임 읽기 한 줄 (명패 툴팁). 손님은 읽기가 없어 빈 글자
+// 이번 게임 읽기 한 줄 (명패 툴팁). 혼자 하기만: 친구와 하기에서는 방장만 남의 성향 요약을 보게 되니 사람에게는 보여 주지 않는다
 function readTip(s, p) {
-  if (!RD || !S.reads) return "";
+  if (mode !== "solo" || !RD || !S.reads) return "";
   let t = "";
   try { t = RD.summaryKo(S.reads, s); } catch { t = ""; }
   return t ? `${s === ME ? "AI가 본 나" : `AI가 본 ${p.name}`} · 이번 게임: ${t}` : "";
@@ -890,7 +898,7 @@ function renderBet(s, h, inHand, bl) {
   let html = "";
   if (inHand && h.phase === "done") {
     const r = h.result, hand = r.hands[s], won = r.won[s];
-    if (bl?.caught) html += `<span class="tag bluff" title="${esc(bl.bluff.map(betKo).join(" · "))} · ${esc(bl.bluff[bl.bluff.length - 1].hand)}">뻥카!</span>`;
+    if (bl?.caught) html += `<span class="tag bluff">뻥카!</span>`;
     // 폰에서는 짧은 족보 이름만 (전체 이름은 결과 · 기록에)
     if (hand) html += `<span class="tag lbl${won ? " win" : ""}"><span class="lf">${esc(hand.label)}</span><span class="ls">${esc(CAT_KO[categoryOf(hand.score)])}</span></span>`;
     if (won > 0) html += `<span class="amt win"><i class="chip"></i>+${fmt(won)}</span>`;
@@ -1075,7 +1083,8 @@ function hintHtml(h, L) {
   const key = `${S.m.handNo}|${h.actions.length}|${ME}`;
   if (hint.key !== key) {
     let d = null;
-    try { d = PokerAI.decide(S.m, ME, { rng: Math.random, reads: S.reads || undefined }); } catch { d = null; }
+    // 읽기로 옮긴 힌트는 혼자 하기만 (친구와 하기에서는 방장만 읽기를 가지고 있어 방장에게만 유리해진다. 봇 · AI가 대신 두는 자리는 그대로 읽기를 쓴다)
+    try { d = PokerAI.decide(S.m, ME, { rng: Math.random, reads: mode === "solo" ? S.reads || undefined : undefined }); } catch { d = null; }
     hint = { key, d };
   }
   const d = hint.d;
@@ -1366,7 +1375,7 @@ function seenMeHtml() {
       <dl class="rules seen-stats">
         <div><dt>베팅에 접은 비율</dt><dd>${rate(folded, p.faced)} <small>${p.faced}번 중 ${folded}</small></dd></div>
         <div><dt>먼저 벳한 비율</dt><dd>${rate(bets, p.betOpp)} <small>${p.betOpp}번 중 ${bets}</small></dd></div>
-        <div><dt>드러난 뻥카</dt><dd>${p.shown.bluff}번 <small>공개 ${p.shownN}번 중</small></dd></div>
+        <div><dt>드러난 뻥카</dt><dd><small>공개된 벳 ${p.shownN}번 중</small> ${p.shown.bluff}번</dd></div>
       </dl>
     </section>`;
 }

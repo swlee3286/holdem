@@ -616,6 +616,7 @@ kbd { font: 500 11px var(--mono); opacity: .55; margin-left: 4px; }
   .tag.bluff { font-size: 11px; padding: 0 6px; }
   .bet.fin.up { flex-direction: row; gap: 5px; } /* 위쪽 자리: 끝난 핸드의 족보 · 딴 칩을 한 줄로 (보드와 겹치지 않게) */
   .bet.fin.up .tag.bluff { position: absolute; bottom: calc(100% + 3px); left: 50%; translate: -50% 0; } /* 뻥카 도장은 그 줄 위에 따로 (옆 자리 결과와 겹치지 않게) */
+  .bet.fin.up.mid .tag.bluff { bottom: auto; top: calc(100% + 4px); } /* 맨 위 가운데 자리는 그 자리 카드에 가리니 줄 아래로 */
   .lbl .lf { display: none; }
   .lbl .ls { display: inline; }
   .amt { font-size: 11.5px; gap: 4px; }

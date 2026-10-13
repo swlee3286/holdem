@@ -5,7 +5,10 @@
 // d) 읽기가 없거나 관련 상대 표본이 없으면 결정이 완전히 같다 (무작위 스팟 수백 개)
 // e) 안전: 합법 · NaN 없음 · 넛 폴드 없음 · 공개되지 않은 카드를 바꿔도 같은 결정 · 속도 (읽기가 있어도 1.3배 이내)
 // f) 착취: 헤즈업 100bb, 게임(150핸드)마다 읽기를 새로 쌓는다. 같은 덱 · 같은 시드로 읽기 엔진과 그냥 GTO 엔진을 둔다
-//    매니악 · 콜링 스테이션 · 오버폴더 상대로는 읽기 엔진이 더 벌고(차이 > 표준오차), GTO 엔진 상대로는 손해가 없다(> −표준오차)
+//    매니악 · 콜링 스테이션 · 오버폴더 상대로는 읽기 엔진이 더 벌고(차이 > 표준오차),
+//    GTO 엔진 상대로는 손해가 없고(시드 세 개를 합쳐 차이 > −2bb/100 · > −2 표준오차),
+//    체크 레이즈로 뻥카를 치는 상대를 '뻥카 거의 없음'으로 읽지 않고 손해도 없다 (차이 > −2bb/100 · > −2 표준오차)
+//    READS_FULL=1이면 GTO · 체크 레이저 줄을 더 길게 (시드 다섯 개 · 판 수 두 배)
 const T = require("../table.js");
 const E = require("../engine.js");
 const AI = require("../gto.js");
@@ -101,6 +104,10 @@ function fakeReads(n, seats, kind) {
 }
 const sameDecision = (a, b) => JSON.stringify([a.action, a.to, a.mix, a.info]) === JSON.stringify([b.action, b.to, b.mix, b.info]);
 
+// 리버 에어 벳이 콜당해 공개되는 헤즈업 핸드 (0번 7♣2♦ vs 1번 K♥Q♦)
+const m1Bluff = () => scripted(2, { 0: "7c 2d", 1: "Kh Qd" }, "As Jd 9c 4s 3h", [
+  [0, "raise", 50], [1, "call"], [1, "check"], [0, "check"], [1, "check"], [0, "check"], [1, "check"], [0, "raise", 100], [1, "call"]]);
+
 // ===== a) 판정 =====
 {
   // 1) 리버 에어 벳이 콜당해 공개 = 뻥카
@@ -129,6 +136,10 @@ const sameDecision = (a, b) => JSON.stringify([a.action, a.to, a.mix, a.info]) =
   ok(RI.classify(C("Kh Qh"), C("9h 4h 2c 7s 3d"), 1).label === "bluff", "리버 약한 벳 = 뻥카");
   ok(RI.classify(C("8c 7c"), C("9h 6d 2s"), 1).draw === "straight" && RI.classify(C("8c 7c"), C("9h 6d 2s"), 1).label === "semi", "양방 = 세미");
   ok(RI.classify(C("Ac 5d"), C("9h 8d 2s"), 1).label === "bluff", "거트샷도 없는 에이스 하이 = 뻥카");
+  // 지는 조합이 하나도 없는 패(보드가 넛이라 나눠 갖는 패 포함)는 상대가 여럿이어도 밸류
+  ok(RI.classify(C("2c 3d"), C("Ah Kh Qh Jh Th"), 2).label === "value", "보드 로열 플러시 3인 = 밸류");
+  ok(RI.classify(C("2c 3d"), C("As Ks Qd Jh Th"), 3).label === "value", "보드 브로드웨이 4인 = 밸류");
+  ok(RI.classify(C("7h 7c"), C("Kd Js 8c 3h 2d"), 2).label === "bluff", "멀티웨이 약한 페어 리버 = 뻥카 (그대로)");
   // 4) 쇼다운 없이 이긴 리버 벳: 판정 없음, 마지막 공격자의 무쇼다운 승리로만 센다
   const m4 = scripted(2, { 0: "7c 2d", 1: "Kh Qd" }, "As Jd 9c 4s 3h", [
     [0, "raise", 50], [1, "call"], [1, "check"], [0, "check"], [1, "check"], [0, "check"], [1, "check"], [0, "raise", 100], [1, "fold"]]);
@@ -191,6 +202,26 @@ const sameDecision = (a, b) => JSON.stringify([a.action, a.to, a.mix, a.info]) =
   const r5 = RD.revealed(m5.hand);
   ok(r5.length === 1 && r5[0].label === "semi" && r5[0].draw === "combo", "올인 공개된 콤보 드로우 = 세미 " + JSON.stringify(r5));
   console.log(`b) public info only: folded seat's cards/deck scrambled 3x → same record/revealed; forbidden reads ${touched}; guest views identical ${views}/3`);
+  // 시간 초과로 자동 폴드 · 체크된 수와 AI가 대신 둔 수는 그 사람의 성향으로 세지 않는다
+  const mt = scripted(2, { 0: "Kd Jc", 1: "8s 3h" }, "Qs 9d 4c 2h 7s", [[0, "raise", 50], [1, "call"], [1, "check"], [0, "raise", 40], [1, "fold"]]);
+  const rPlain = RD.create(2);
+  RD.record(rPlain, mt, mt.hand);
+  const mt2 = JSON.parse(JSON.stringify(mt));
+  mt2.hand.actions.find((a) => a.street === 1 && a.type === "fold").timeout = true;
+  mt2.hand.actions.find((a) => a.street === 1 && a.type === "check").timeout = true;
+  const rTime = RD.create(2);
+  RD.record(rTime, mt2, mt2.hand);
+  const zp = rPlain.seats[1], zt = rTime.seats[1];
+  ok(zp.faced === 1 && zp.foldFaced === 1 && zp.w.fN > 0 && zt.faced === 0 && zt.foldFaced === 0 && zt.folds === 0 && zt.w.fN === 0 && zt.w.fX === 0 && zt.betOpp === 0 && zt.w.aN === 0,
+    "시간 초과 폴드 · 체크는 세지 않는다 " + JSON.stringify([zp, zt]));
+  ok(rTime.seats[0].bets === 1 && rTime.seats[0].takedowns === 1, "시간 초과여도 상대의 벳 · 무쇼다운 승리는 센다");
+  // AI가 대신 친 리버 벳(쇼다운에서 공개)은 판정하지도 · 세지도 않는다
+  const plainRev = RD.revealed(m1Bluff().hand).length;
+  const ma = JSON.parse(JSON.stringify(m1Bluff()));
+  ma.hand.actions.find((a) => a.street === 3 && (a.type === "bet" || a.type === "raise")).auto = true;
+  const ra = RD.create(2);
+  RD.record(ra, ma, ma.hand);
+  ok(plainRev === 1 && RD.revealed(ma.hand).length === 0 && ra.seats[0].shown.bluff === 0 && ra.seats[0].bets === 0 && ra.seats[0].w.sN === 0, "AI가 대신 친 벳은 뻥카로 판정하지 않는다");
 }
 
 // ===== 아키타입 봇 (PokerTable 합법 수만) =====
@@ -225,6 +256,15 @@ const BOTS = {
     return hs > 0.65 ? { action: "call" } : { action: "fold" };
   },
   gto: (m, s, rng) => AI.decide(m, s, { rng }),
+  // 체크 레이저: 프리플롭은 GTO 엔진, 플롭 이후 먼저 벳은 하지 않고, 베팅을 맞으면 강한 패와 에어의 45%로 팟 레이즈 (먼저 벳 빈도는 낮지만 레이즈엔 뻥카가 많다)
+  checkraiser(m, s, rng) {
+    const h = m.hand, L = T.legal(m, s);
+    if (h.street === 0) return AI.decide(m, s, { rng });
+    const hs = hsOf(h, s);
+    if (L.toCall === 0) return { action: "check" };
+    if (L.canRaise && (hs > 0.85 || (hs < 0.35 && rng() < 0.45))) return { action: "raise", to: potBet(m, s, 1) };
+    return hs > 0.5 ? { action: "call" } : { action: "fold" };
+  },
 };
 // 결정 지점마다 고정된 난수 (두 팔이 같은 지점에서는 같은 난수를 쓴다)
 const pointRng = (hseed, h, s) => mulberry32((hseed * 31 + h.actions.length * 7919 + s * 104729) >>> 0);
@@ -302,7 +342,7 @@ function ex1() {
   }
   console.log(`c) 6 hands of extreme evidence (river bluffs shown ${p6.shown.bluff}/${p6.shownN}, never folds): trust ${p6.trust.toFixed(2)}, river bluff index ${p6.bluffyRiver.toFixed(2)} → max |defend shift| ${maxDs.toFixed(3)} (cap 0.25), max |bluff scale − 1| ${maxBs.toFixed(3)}`);
   ok(p6.shown.bluff >= 6 && maxDs <= 0.06 && maxBs <= 0.1, `몇 핸드로 크게 움직임: ds ${maxDs} bs ${maxBs}`);
-  ok(/6판 · 공개 \d+번 중 뻥카 \d+/.test(RD.summaryKo(ex, 1)), "요약에 표본 수 " + RD.summaryKo(ex, 1));
+  ok(/6판 · 공개된 벳 \d+번 중 뻥카 \d+/.test(RD.summaryKo(ex, 1)), "요약에 표본 수 " + RD.summaryKo(ex, 1));
 }
 
 // ===== d) 읽기가 없거나 관련 상대 표본이 없으면 똑같다 =====
@@ -392,12 +432,30 @@ const spots = [];
     ok(d.info.read && d.info.read.defendShift < 0, "넛 스팟에서 '더 접기' 읽기가 적용돼야 한다");
   }
   ok(nutFold === 0, "넛 폴드 " + nutFold);
+  // 다른 사람이 이미 콜한 베팅: 베터를 '뻥카 잦음'으로 읽었어도 더 넓게 받지 않는다 (헤즈업이면 넓게 받는다)
+  {
+    const cont = (d) => d.mix.filter((x) => x.action !== "fold").reduce((t, x) => t + x.freq, 0);
+    let wider = 0, notWider = 0, nOver = 0, nHu = 0;
+    for (const hero of ["Qc 8d", "Ac 4c", "Ah Th"]) {
+      const over = scripted(3, { 2: hero }, "Kh 8s 4d 2c 7h", [[0, "raise", 60], [1, "call"], [2, "call"], [1, "check"], [2, "check"], [0, "raise", 90], [1, "call"], [2, "call"],
+        [1, "check"], [2, "check"], [0, "raise", 250], [1, "call"], [2, "call"], [1, "check"], [2, "check"], [0, "raise", 900], [1, "call"]]);
+      const a = AI.decide(over, 2, { rng: mulberry32(5) }), b = AI.decide(over, 2, { rng: mulberry32(5), reads: fakeReads(3, [0], "maniac") });
+      nOver++;
+      if (cont(b) <= cont(a) + 1e-9 && !(b.info.read && b.info.read.defendShift > 0)) notWider++;
+      const hu = scripted(3, { 2: hero }, "Kh 8s 4d 2c 7h", [[0, "raise", 60], [1, "fold"], [2, "call"], [2, "check"], [0, "raise", 90], [2, "call"], [2, "check"], [0, "raise", 250], [2, "call"], [2, "check"], [0, "raise", 640]]);
+      const c = AI.decide(hu, 2, { rng: mulberry32(5), reads: fakeReads(3, [0], "maniac") });
+      nHu++;
+      if (c.info.read && c.info.read.defendShift > 0) wider++;
+    }
+    ok(notWider === nOver && wider === nHu, `콜한 사람이 있으면 넓게 받지 않는다 ${notWider}/${nOver} · 헤즈업은 넓게 ${wider}/${nHu}`);
+    console.log(`   overcall after a caller vs 'bluffs often' bettor: not widened ${notWider}/${nOver}; heads-up widened ${wider}/${nHu}`);
+  }
   // 설명: info.read와 describeMix
   {
     const m = scripted(2, { 0: "8s 3h", 1: "Kd Jc" }, "Qs 9d 4c 2h 7s", [[0, "raise", 50], [1, "call"], [1, "check"], [0, "check"], [1, "check"], [0, "check"], [1, "check"], [0, "raise", 60]]);
     const d = AI.decide(m, 1, { rng: mulberry32(1), reads: fakeReads(2, [0], "maniac") });
     const txt = AI.describeMix(d);
-    ok(d.info.read && d.info.read.seat === 0 && d.info.read.defendShift > 0 && /뻥카 잦음/.test(d.info.read.noteKo) && /Adjusted by this game's reads: P0 bets\/bluffs more than GTO/.test(txt), "읽기 설명 " + txt);
+    ok(d.info.read && d.info.read.seat === 0 && d.info.read.defendShift > 0 && /P0 리버 뻥카 잦음/.test(d.info.read.noteKo) && /Adjusted by this game's reads: P0 bluffs more than GTO on the river/.test(txt), "읽기 설명 " + txt);
     console.log("   describeMix with read:", txt.replace(/^.*Adjusted/, "… Adjusted"));
   }
   // 속도: 같은 스팟에서 읽기 있음 / 없음 번갈아
@@ -422,9 +480,10 @@ const spots = [];
 // ===== f) 착취 =====
 // 게임마다(150핸드) 읽기를 새로 만든다. 한 판(deal)마다 같은 덱으로 네 게임: {그냥 GTO · 읽기 엔진} × {0번 자리 · 1번 자리}
 // 결과는 hero 자리의 bb/100. 차이 = 같은 덱의 (읽기 − 그냥), 표준오차는 판별 차이로 계산
-// (참고: 같은 설정으로 시드 31 · 41 · 42를 돌린 차이 — 매니악 +39 · +84 · +75, 스테이션 +99 · +63 · +61, 오버폴더 +20 · +43 · +30, GTO −5 · +1 · +3 bb/100)
+// (참고: 다른 시드 · 판 수로 돌린 차이 — 매니악 +64(시드 101), 스테이션 +64(202), 오버폴더 +10 · +17(101 · 41), GTO −1.3 · −1.4 · −0.2 · +1.9(101 · 202 · 303 · 606, 각 3000판),
+//  체크 레이저 +0.2 · −1.5(101 · 303) bb/100. 데드존이 좁을 때는 GTO 상대로 시드에 따라 −3~−8bb/100을 잃었다)
 function readsDuel(opp, matches, hands, seed) {
-  const plain = [], withReads = [], diffs = [];
+  const plain = [], withReads = [], diffs = [], lasts = [];
   let last = null;
   for (let g = 0; g < matches; g++) {
     const games = [];
@@ -436,24 +495,46 @@ function readsDuel(opp, matches, hands, seed) {
       plain.push(net.plain); withReads.push(net.reads); diffs.push(net.reads - net.plain);
     }
     last = games.find((G) => G.arm === "reads" && G.hero === 0).reads;
+    lasts.push(...games.filter((G) => G.arm === "reads").map((G) => (G.hero === 0 ? G.reads : null)).filter(Boolean));
   }
   const stat = (a) => {
     const n = a.length, mean = a.reduce((t, x) => t + x, 0) / n, sd = Math.sqrt(a.reduce((t, x) => t + (x - mean) ** 2, 0) / n);
     return { bb100: (mean / 2) * 100, se: (sd / Math.sqrt(n) / 2) * 100 };
   };
-  return { plain: stat(plain), reads: stat(withReads), diff: stat(diffs), last, deals: matches * hands };
+  return { plain: stat(plain), reads: stat(withReads), diff: stat(diffs), last, lasts, deals: matches * hands };
 }
+// 시드 여러 개 합치기 (같은 판 수라 평균 · 표준오차를 그대로 묶는다)
+const pool = (xs) => ({ bb100: xs.reduce((t, x) => t + x.bb100, 0) / xs.length, se: Math.sqrt(xs.reduce((t, x) => t + x.se * x.se, 0)) / xs.length });
 {
   console.log("f) exploitation, heads-up 100bb, reads rebuilt every 150-hand game (hero bb/100 ± SE):");
   const f = (x) => `${x.bb100.toFixed(1).padStart(6)} ±${x.se.toFixed(1)}`;
-  const rows = [["maniac", 8, "뻥카 잦음"], ["station", 6, "잘 안 접음"], ["folder", 8, "베팅에 잘 접음"], ["gto", 8, null]];
-  for (const [opp, matches, trait] of rows) {
-    const t1 = Date.now(), r = readsDuel(opp, matches, 150, 41);
-    console.log(`   vs ${opp.padEnd(8)} plain GTO ${f(r.plain)} | with reads ${f(r.reads)} | difference ${f(r.diff)}  (${r.deals} deals × 2 seats, ${((Date.now() - t1) / 1000).toFixed(1)}s)`);
+  const full = process.env.READS_FULL === "1";
+  // [상대, 게임 수, 시드들, 있어야 할 성향, 없어야 할 성향, 읽기 엔진 자리(GTO + 읽기)에 없어야 할 성향]
+  // 스테이션: 모든 벳이 쇼다운까지 가도 GTO 엔진 자리를 '뻥카 잦음'으로 읽지 않는다
+  const rows = [
+    ["maniac", 8, [41], "뻥카 잦음"], ["station", 6, [41], "잘 안 접음", null, "뻥카 잦음"], ["folder", 8, [41], "베팅에 잘 접음"],
+    ["gto", full ? 16 : 8, full ? [41, 101, 303, 505, 707] : [41, 101, 303]],
+    ["checkraiser", full ? 16 : 8, full ? [41, 202] : [41], null, "뻥카 거의 없음"],
+  ];
+  for (const [opp, matches, seeds, trait, notTrait, heroNot] of rows) {
+    const t1 = Date.now(), rs = seeds.map((seed) => readsDuel(opp, matches, 150, seed));
+    const r = { plain: pool(rs.map((x) => x.plain)), reads: pool(rs.map((x) => x.reads)), diff: pool(rs.map((x) => x.diff)), last: rs[rs.length - 1].last, deals: rs.reduce((t, x) => t + x.deals, 0) };
+    console.log(`   vs ${opp.padEnd(11)} plain GTO ${f(r.plain)} | with reads ${f(r.reads)} | difference ${f(r.diff)}  (${r.deals} deals × 2 seats, seeds ${seeds.join("/")}${seeds.length > 1 ? `: ${rs.map((x) => x.diff.bb100.toFixed(1)).join(" / ")}` : ""}, ${((Date.now() - t1) / 1000).toFixed(1)}s)`);
     console.log(`      read after a game: ${RD.summaryKo(r.last, 1)} | ${RD.summaryEn(r.last, 1, opp)}`);
-    if (opp === "gto") ok(r.diff.bb100 > -r.diff.se, `GTO 상대 손해: ${r.diff.bb100.toFixed(1)} ±${r.diff.se.toFixed(1)}`);
+    if (opp === "gto") ok(r.diff.bb100 > -2 && r.diff.bb100 > -2 * r.diff.se, `GTO 상대 손해: ${r.diff.bb100.toFixed(1)} ±${r.diff.se.toFixed(1)}`);
+    else if (opp === "checkraiser") ok(r.diff.bb100 > -2 && r.diff.bb100 > -2 * r.diff.se, `체크 레이저 상대 손해: ${r.diff.bb100.toFixed(1)} ±${r.diff.se.toFixed(1)}`);
     else ok(r.diff.bb100 > r.diff.se, `vs ${opp}: 읽기 이득 ${r.diff.bb100.toFixed(1)} ±${r.diff.se.toFixed(1)}`);
     if (trait) ok(RD.summaryKo(r.last, 1).includes(trait) && /\(150판/.test(RD.summaryKo(r.last, 1)) && /this game only, 150 hands/.test(RD.summaryEn(r.last, 1)), `${opp} 요약 "${RD.summaryKo(r.last, 1)}"`);
+    if (notTrait) {
+      const bad = rs.reduce((t, x) => t + x.lasts.filter((g) => RD.summaryKo(g, 1).includes(notTrait)).length, 0), all = rs.reduce((t, x) => t + x.lasts.length, 0);
+      console.log(`      games read as "${notTrait}": ${bad}/${all}`);
+      ok(bad === 0, `${opp}를 "${notTrait}"로 읽음 ${bad}/${all}`);
+    }
+    if (heroNot) {
+      const bad = rs.reduce((t, x) => t + x.lasts.filter((g) => RD.summaryKo(g, 0).includes(heroNot)).length, 0), all = rs.reduce((t, x) => t + x.lasts.length, 0);
+      console.log(`      GTO+reads seat read as "${heroNot}": ${bad}/${all}`);
+      ok(bad === 0, `vs ${opp}: GTO 엔진 자리를 "${heroNot}"로 읽음 ${bad}/${all}`);
+    }
   }
 }
 

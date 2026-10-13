@@ -573,7 +573,7 @@ function expectedSounds(h, me, busted) {
   if (won) add("win");
   for (let i = 0; i < h.result.pots.length - (won ? 1 : 0); i++) add("chip"); // 팟이 이긴 사람에게 갈 때
   if (h.seats.some((s) => s !== me && !h.folded[s] && h.shown[s])) add("flip"); // 남의 카드 공개
-  if (READS.revealed(h).some((x) => x.label === "bluff" && x.weakEnd)) add("bluff"); // 쇼다운에서 들킨 뻥카 (핸드에 한 번)
+  if (READS.revealed(h).some((x) => x.label === "bluff" && x.weakEnd && !(h.result.won[x.seat] > 0))) add("bluff"); // 쇼다운에서 들킨 뻥카 (팟을 못 가져간 자리, 핸드에 한 번)
   return e;
 }
 const countBy = (list) => list.reduce((c, x) => ((c[x] = (c[x] || 0) + 1), c), {});
@@ -857,6 +857,10 @@ async function scenarioG(browser, web) {
   ok(hb.tags.includes(1) && gb.tags.includes(1) && hb.snd === 1 && gb.snd === 1, "친구와 하기: 방장 · 손님 모두 손님 자리에 도장 · 소리 한 번 " + JSON.stringify({ hb, gb }));
   ok(hb.log.some((l) => l.includes("손님G</b> 뻥카였어요")) && gb.log.some((l) => l.includes("내 뻥카가 들켰어요")), "친구와 하기: 기록 줄 (방장: 이름 · 손님: 내 뻥카)");
   ok(hb.reads && hb.reads.bluff[1] >= 1 && gb.reads === null, "읽기는 방장만 (손님은 받은 화면으로 표시만) " + JSON.stringify([hb.reads, gb.reads]));
+  // 사람에게 보여 주는 읽기(명패 툴팁)는 혼자 하기만: 친구와 하기에서는 방장 · 손님 모두 없다
+  const tips = async (pg) => pg.evaluate(() => [...document.querySelectorAll(".plate")].map((p) => p.title).filter(Boolean));
+  const ht = await tips(host), gt = await tips(g);
+  ok(ht.length === 0 && gt.length === 0, "친구와 하기: 명패 읽기 툴팁 없음 (방장 · 손님 같게) " + JSON.stringify([ht, gt]));
   // 다시 하기(같은 방 새 게임) = 새 읽기
   await host.evaluate(() => { newMatchMP(); lobbyBroadcast(); });
   const mf = await host.evaluate(() => ({ hands: S.reads.hands, last: S.reads.last, bluff: S.reads.seats.map((z) => z.shown.bluff) }));
