@@ -1,6 +1,6 @@
 // ===== 설정 =====
 // 2~6인 노리밋 홀덤 화면. 규칙은 table.js(PokerTable), AI는 gto.js(PokerAI), 카드·족보는 engine.js, 온라인은 net.js(PokerNet),
-// 움직임은 motion.js(PokerMotion), 효과음은 sound.js(PokerSound)
+// 이번 게임 상대 읽기(뻥카 · 접는 성향)는 reads.js(PokerReads), 움직임은 motion.js(PokerMotion), 효과음은 sound.js(PokerSound)
 const SAVE_KEY = "holdem-table-v2";
 const HINT_KEY = "holdem-table-v2-hint";
 const ROOM_KEY = "holdem-room-v1";   // 방장: 방 · 매치 (새로고침하면 같은 코드로 다시 연다)
@@ -22,6 +22,7 @@ const ROSTER = [
 const STREET_KO = ["프리플롭", "플롭", "턴", "리버"];
 const STREET_EN = ["Preflop", "Flop", "Turn", "River"];
 const PT = PokerTable;
+const RD = typeof PokerReads === "object" ? PokerReads : null; // 이번 게임 읽기 (없어도 게임은 그대로, AI는 읽기 없이)
 const PUBLIC_URL = "https://swlee3286.github.io/holdem/";
 
 // ===== 자리 배치 =====
@@ -152,6 +153,7 @@ function newMatch(n, claudeOn) {
     claudeOn: !!claudeOn,
     depth: S?.depth === "default" ? "default" : "quick",
     stats: { hands: 0, vpip: 0, pfr: 0, aggr: 0, calls: 0, facedBet: 0, foldedToBet: 0, showdowns: [] }, // 내 성향 (Claude가 참고)
+    reads: newReads(n), // 이번 게임 상대 읽기: 자리별, 공개 정보만. 새 게임마다 0부터 (이어하기 · 새로고침은 그대로)
     history: [],   // 끝난 핸드 기록 (최근 30개)
     log: [],       // 지금 핸드 기록
     logAt: null,   // 기록에 옮긴 위치
@@ -164,6 +166,7 @@ function newMatch(n, claudeOn) {
   };
   fast = false;
   tableKey = controlsKey = logKey = turnKey = "";
+  hint = { key: "", d: null }; // 지난 게임의 힌트(읽기 줄 포함)를 다시 쓰지 않게
   FX?.fresh(); // 첫 핸드도 카드를 나눠 주는 것부터 (이어하기 · 새로고침은 비교 없이 그대로)
   startHand();
 }
@@ -283,7 +286,52 @@ function handDone(h) {
   }
   const gain = h.seats.includes(ME) ? m.players[ME].stack - h.start[ME] : null;
   S.history = [{ no: h.no, net: gain, log: S.log.slice() }, ...S.history].slice(0, 30);
+  // 이번 게임 읽기에 더한다 (혼자 하기 · 방장만: 진짜 매치를 가진 쪽. 손님은 읽기를 쓰지 않는다)
+  if (mode !== "guest" && RD && S.reads) { try { RD.record(S.reads, m, h); } catch {} }
 }
+
+// ===== 이번 게임 읽기 =====
+// 새 게임마다 새로 만든다. 저장해 둔 게임을 이어할 때는 모양이 맞으면 그대로, 없거나 틀리면(예전 저장) 새로
+function newReads(n) {
+  try { return RD ? RD.create(n) : null; } catch { return null; }
+}
+function fixReads(g) {
+  if (!g || !g.m || !RD) return;
+  const n = g.m.players.length;
+  let okReads = false;
+  try { okReads = RD.valid(g.reads, n) && g.reads.last <= g.m.handNo; } catch {}
+  if (!okReads) g.reads = newReads(n);
+}
+
+// 끝난 핸드에서 공개된 카드로 판정한 벳 · 레이즈 (모두가 본 것만이라 손님도 받은 화면으로 같은 판정). 핸드마다 한 번 계산
+let revCache = { owner: null, key: "", list: [] };
+function revealedOf(h) {
+  if (!RD || !h || h.phase !== "done" || !h.result?.showdown) return [];
+  const key = `${h.no}|${h.actions.length}|${h.board.length}|${h.shown.join()}`;
+  if (revCache.owner !== S || revCache.key !== key) {
+    let list = [];
+    try { list = RD.revealed(h); } catch {}
+    revCache = { owner: S, key, list };
+  }
+  return revCache.list;
+}
+// 자리별 뻥카 · 세미블러프 (밸류는 뺀다) → { seat: { bluff: [...], semi: [...], caught, wonWeak } }
+// caught: 쇼다운에서도 여전히 약한 패로 팟을 못 가져갔다 = 들킨 뻥카 ('뻥카!' 도장 · 소리).
+// wonWeak: 끝까지 약한 패였지만 그래도 이겼다. 둘 다 아니면 뻥카 벳 뒤에 맞았거나 중간 패의 얇은 벳 → 모두 기록에만 조용히
+function bluffsOf(h) {
+  const by = {};
+  for (const x of revealedOf(h)) {
+    if (x.label === "value") continue;
+    const o = (by[x.seat] ||= { bluff: [], semi: [], caught: false, wonWeak: false });
+    if (x.label === "bluff") {
+      o.bluff.push(x);
+      if (x.weakEnd) { if (h.result.won[x.seat] > 0) o.wonWeak = true; else o.caught = true; }
+    } else o.semi.push(x);
+  }
+  return by;
+}
+const DRAW_KO = { flush: "플러시 드로우", straight: "스트레이트 드로우", combo: "플러시 · 스트레이트 드로우" };
+const betKo = (x) => `${STREET_KO[x.street]} ${x.type === "bet" ? "벳" : "레이즈"}`;
 
 const needsEndModal = () => (S.m.over && S.ended !== "over") || (S.m.players[ME].out && !S.ended);
 
@@ -317,10 +365,11 @@ function trackHuman(h, type, L) {
 
 // ===== AI =====
 // GTO 엔진의 수를 실제로 둘 수 있는 수로 맞춘다
-function engineMove(m, seat) {
+// names(선택): 읽기 설명에 쓸 자리 이름 (Claude 프롬프트: "Human" 등)
+function engineMove(m, seat, names) {
   const L = PT.legal(m, seat);
   let d = null;
-  try { d = PokerAI.decide(m, seat, { rng: Math.random }); } catch { d = null; }
+  try { d = PokerAI.decide(m, seat, { rng: Math.random, reads: S?.reads || undefined, names }); } catch { d = null; }
   const c = d && normalize(d.action, d.to, L);
   if (c) return { ...c, d };
   // 엔진이 답하지 못하면: 공짜면 체크, 싸면 콜, 아니면 폴드
@@ -355,7 +404,7 @@ async function claudeTurn(h) {
   const m = S.m, seat = CLAUDE;
   if (thinking && thinking.hand === h) return;
   const L = PT.legal(m, seat);
-  const eng = engineMove(m, seat);
+  const eng = engineMove(m, seat, m.players.map((p, s) => whoEn(s, seat))); // 엔진 조언의 읽기 설명도 프롬프트와 같은 이름으로
   const ctl = new AbortController();
   const me = { hand: h, ctl, n: h.actions.length };
   thinking = me;
@@ -420,12 +469,32 @@ function parseChoice(r, L) {
 }
 
 const cardsEn = (cs) => cs.map(cardCode).join(" ");
+// 프롬프트에서 부르는 자리 이름
+const whoEn = (s, seat) => (s === seat ? "You (Claude)" : s === YOU ? "Human" : `${S.m.players[s].name} (bot)`);
+
+// 이번 게임 읽기: 이 핸드에 아직 남은 상대마다 한 줄 (표본 수 포함. 이미 접은 상대는 이번 결정과 상관없어 뺀다).
+// 공개 정보만 — 모두가 본 액션과 쇼다운에 공개된 카드. 카드는 사람의 지난 쇼다운(테이블에 공개된 것)만 들어간다
+function readsEn(h, seat, who) {
+  const st = S.stats, out = [];
+  const seats = h.seats.filter((s) => s !== seat && !h.folded[s]);
+  for (const s of seats) {
+    let line = "";
+    try { line = RD && S.reads ? RD.summaryEn(S.reads, s, who(s)) : ""; } catch { line = ""; }
+    if (!line) line = `${who(s)} (this game only): no finished hands seen yet.`;
+    let p = null;
+    try { p = RD && S.reads ? RD.profile(S.reads, s) : null; } catch { p = null; }
+    if (p && p.hands) line += ` Preflop: VPIP ${pct(Math.round(p.vpip * p.hands), p.hands)}, PFR ${pct(Math.round(p.pfr * p.hands), p.hands)}.`;
+    if (s === YOU && st?.showdowns?.length) line += ` Their recent showdown hands: ${st.showdowns.map((x) => `${x.cards} (${x.hand} on ${x.board})`).join("; ")}.`;
+    out.push(`- ${line}`);
+  }
+  return out.join("\n");
+}
 
 function buildPrompt(h, seat, L, eng) {
-  const m = S.m, P = m.players, pos = PT.positionsOf(h), st = S.stats, bb = h.bb;
+  const m = S.m, P = m.players, pos = PT.positionsOf(h), bb = h.bb;
   const pot = PT.potTotal(h), me = P[seat];
   const bbs = (x) => `${(x / bb).toFixed(1)} bb`;
-  const who = (s) => (s === seat ? "You (Claude)" : s === YOU ? "Human" : `${P[s].name} (bot)`);
+  const who = (s) => whoEn(s, seat);
   const order = [];
   for (let s = PT.nextIn(h.seats, h.button), k = 0; k < h.seats.length; k++, s = PT.nextIn(h.seats, s)) order.push(s);
   const seats = order.map((s) => {
@@ -439,9 +508,6 @@ function buildPrompt(h, seat, L, eng) {
     const top = L.maxTo === h.bets[seat] + me.stack ? "all-in" : "covers every opponent still in";
     options.push(`"raise" with "to" from ${L.minTo} to ${L.maxTo} (${L.maxTo} = ${top})${L.isBet ? "; on this street that is an opening bet" : ""}`);
   }
-  const showdowns = st.showdowns.length
-    ? ` Their recent showdown hands: ${st.showdowns.map((s) => `${s.cards} (${s.hand} on ${s.board})`).join("; ")}.`
-    : " No showdowns yet.";
   const live = PT.liveSeats(m).length;
   const opponents = PT.aliveSeats(h).length - 1;
   return [
@@ -460,12 +526,13 @@ function buildPrompt(h, seat, L, eng) {
     "",
     `GTO engine advice for exactly this spot: ${mixText(eng.d) || `engine picks ${eng.action}${eng.to ? ` to ${eng.to}` : ""}`}`,
     "",
-    `Human this match (${st.hands} hands dealt in): voluntarily puts money in preflop ${pct(st.vpip, st.hands)} (VPIP), raises preflop ${pct(st.pfr, st.hands)} (PFR); after the flop ${st.aggr} bets/raises vs ${st.calls} calls; folded to a bet or raise ${st.foldedToBet} of ${st.facedBet} times.${showdowns}`,
-    "The bot players follow the GTO engine closely.",
+    "Reads on the opponents still in this hand, from this game only (they reset when a new game starts). Built only from public information: actions everyone saw, and hole cards only when shown at showdown. Trust them only as far as the sample sizes allow:",
+    readsEn(h, seat, who),
+    "The bot players follow the same GTO engine, which also adapts a little to these reads.",
     "",
     `Your legal actions now: ${options.join("; ")}.`,
     `"to" is your TOTAL bet on this street after raising, not the increment.`,
-    "Default to the engine's mixed strategy: pick among its actions roughly in its frequencies and use its sizes. Deviate only when you have a concrete exploitative reason from the Human's tendencies or this hand's action (for example, they fold to bets far too often, or they almost never bluff).",
+    "Default to the engine's mixed strategy: pick among its actions roughly in its frequencies and use its sizes. Deviate only when you have a concrete exploitative reason from the reads above or this hand's action (for example, an opponent folds to bets far too often, or almost never bluffs), and only with enough hands behind the read.",
     "",
     'Reply with only a JSON object: {"action": "<fold|check|call|raise>", "to": <number, only for raise>, "say": "<table talk>"}.',
     '"say" is one short line you say at the table, in casual, friendly Korean (반말), at most 30 characters. It may tease or bluff lightly, but never state or hint your actual hole cards. Use "" when you have nothing to say.',
@@ -569,6 +636,28 @@ function syncLog() {
         const hand = r.hands[s];
         if (hand && h.hole[s]?.[0] != null) addLog(`${esc(nm(s))} ${cardsHtml(h.hole[s])} — ${esc(hand.label)}`);
       }
+      // 공개된 패로 본 뻥카 · 세미블러프 (밸류 벳은 적지 않는다)
+      const by = bluffsOf(h);
+      for (const s of h.seats) {
+        const b = by[s];
+        if (!b) continue;
+        const who = s === ME ? "내" : esc(nm(s)), last = b.bluff[b.bluff.length - 1];
+        const fin = r.hands[s] ? esc(r.hands[s].label) : last ? esc(last.hand) : ""; // 마지막 족보 (쇼다운에 보인 패)
+        const streets = b.bluff.map(betKo).join(" · ");
+        const josa = last && last.type === "bet" ? "은" : "는"; // 벳은 · 레이즈는
+        if (b.caught) {
+          addLog(`<span class="bluff-line">${s === ME ? `내 뻥카가 들켰어요` : `<b>${esc(nm(s))}</b> 뻥카였어요`} · ${streets}, ${fin}</span>`);
+        } else if (b.wonWeak) { // 끝까지 약한 패였지만 상대가 더 약했다
+          addLog(`<span class="semi-line">${who} ${streets}${josa} 뻥카였지만 이겼어요 · ${fin}</span>`);
+        } else if (b.bluff.length) {
+          // 뻥카로 벳한 뒤 족보가 올라갔으면 '맞았어요', 아니면 그냥 중간 패로 한 얇은 벳 (상대가 여럿이면 중간 패도 약하게 본다)
+          const up = r.hands[s] && categoryOf(r.hands[s].score) > categoryOf(last.score);
+          addLog(`<span class="semi-line">${who} ${streets}${josa} ${up ? "뻥카였는데 맞았어요" : "얇은 벳이었어요"} · ${fin}</span>`);
+        } else if (b.semi.length) {
+          const x = b.semi[b.semi.length - 1];
+          addLog(`<span class="semi-line">${who} 세미블러프 · ${b.semi.map(betKo).join(" · ")}${x.draw ? ` (${DRAW_KO[x.draw]})` : ""}</span>`);
+        }
+      }
     }
     r.pots.forEach((p, i) => {
       const title = r.pots.length === 1 ? "팟" : i === 0 ? "메인 팟" : `사이드 팟 ${i}`;
@@ -591,6 +680,7 @@ function load() {
     // 끝난 매치는 최종 결과 창을 아직 못 봤을 때만 되살린다
     if (!g || g.v !== 2 || !m || m.v !== 2 || !Array.isArray(m.players) || !m.hand || (m.over && g.ended === "over")) return null;
     if (m.players.length < 2 || m.players.length > 6 || !g.stats || !Array.isArray(g.history) || !Array.isArray(g.log) || !g.logAt) return null;
+    fixReads(g); // 같은 게임의 읽기는 이어 쓴다 (예전 저장이면 지금부터 새로)
     return g;
   } catch {
     return null;
@@ -728,7 +818,7 @@ function buildTable(n) {
         ${s === me ? `<span class="made" id="made"></span>` : ""}
         ${claudeSeat ? `<div class="bubble${lay.bubble ? ` ${lay.bubble}` : x > 60 ? " to-left" : ""}" id="bubble" aria-live="polite"></div>` : ""}
       </div>
-      <div class="bet${y < 45 ? " up" : ""}" id="bet-${s}" style="left:${bx}%;top:${by}%"></div>`;
+      <div class="bet${y < 45 ? " up" : ""}${y < 45 && bx === 50 && by < 25 ? " mid" : ""}" id="bet-${s}" style="left:${bx}%;top:${by}%"></div>`;
   }
   $("seats").innerHTML = html;
   const t = $("table");
@@ -760,7 +850,7 @@ function winningCards(h) {
 
 function renderSeats() {
   const m = S.m, h = m.hand, pos = PT.positionsOf(h), done = h.phase === "done";
-  const best = winningCards(h), sd = done && h.result.showdown;
+  const best = winningCards(h), sd = done && h.result.showdown, bluffs = sd ? bluffsOf(h) : {};
   m.players.forEach((p, s) => {
     const el = $(`seat-${s}`);
     if (!el) return;
@@ -780,7 +870,10 @@ function renderSeats() {
     let cards = [];
     if (inHand && (!folded || s === ME) && h.hole[s]) cards = h.hole[s].map((c) => (c !== null && (s === ME || h.shown[s]) ? c : "back"));
     renderCards($(`hole-${s}`), cards, (c) => (c === "back" ? "" : folded ? "dim" : sd && h.shown[s] ? (best.has(c) ? "win" : "dim") : ""));
-    renderBet(s, h, inHand);
+    renderBet(s, h, inHand, bluffs[s]);
+    // 명패에 마우스를 올리면: 이번 게임에서 AI가 본 이 자리 (혼자 하기 · 방장)
+    const plate = el.querySelector(".plate"), tip = readTip(s, p);
+    if (plate && plate.title !== tip) plate.title = tip;
   });
   // 지금 내 패 이름 (보드가 깔린 뒤)
   const made = $("made");
@@ -790,13 +883,22 @@ function renderSeats() {
   }
 }
 
-// 자리 앞 베팅 칩 · 행동 표시 (끝나면 족보 · 딴 칩)
-function renderBet(s, h, inHand) {
+// 이번 게임 읽기 한 줄 (명패 툴팁). 혼자 하기만: 친구와 하기에서는 방장만 남의 성향 요약을 보게 되니 사람에게는 보여 주지 않는다
+function readTip(s, p) {
+  if (mode !== "solo" || !RD || !S.reads) return "";
+  let t = "";
+  try { t = RD.summaryKo(S.reads, s); } catch { t = ""; }
+  return t ? `${s === ME ? "AI가 본 나" : `AI가 본 ${p.name}`} · 이번 게임: ${t}` : "";
+}
+
+// 자리 앞 베팅 칩 · 행동 표시 (끝나면 족보 · 딴 칩 · 공개된 패로 드러난 뻥카)
+function renderBet(s, h, inHand, bl) {
   const el = $(`bet-${s}`);
   if (!el) return;
   let html = "";
   if (inHand && h.phase === "done") {
     const r = h.result, hand = r.hands[s], won = r.won[s];
+    if (bl?.caught) html += `<span class="tag bluff">뻥카!</span>`;
     // 폰에서는 짧은 족보 이름만 (전체 이름은 결과 · 기록에)
     if (hand) html += `<span class="tag lbl${won ? " win" : ""}"><span class="lf">${esc(hand.label)}</span><span class="ls">${esc(CAT_KO[categoryOf(hand.score)])}</span></span>`;
     if (won > 0) html += `<span class="amt win"><i class="chip"></i>+${fmt(won)}</span>`;
@@ -981,7 +1083,8 @@ function hintHtml(h, L) {
   const key = `${S.m.handNo}|${h.actions.length}|${ME}`;
   if (hint.key !== key) {
     let d = null;
-    try { d = PokerAI.decide(S.m, ME, { rng: Math.random }); } catch { d = null; }
+    // 읽기로 옮긴 힌트는 혼자 하기만 (친구와 하기에서는 방장만 읽기를 가지고 있어 방장에게만 유리해진다. 봇 · AI가 대신 두는 자리는 그대로 읽기를 쓴다)
+    try { d = PokerAI.decide(S.m, ME, { rng: Math.random, reads: mode === "solo" ? S.reads || undefined : undefined }); } catch { d = null; }
     hint = { key, d };
   }
   const d = hint.d;
@@ -997,10 +1100,13 @@ function hintHtml(h, L) {
     return { kind, label, freq: x.freq };
   });
   const eq = Number(d.info?.equity);
+  // 이번 게임 읽기로 엔진이 비율을 옮겼으면 한 줄 (예: 민지 뻥카 잦음 → 더 넓게 받음)
+  const read = typeof d.info?.read?.noteKo === "string" && d.info.read.noteKo ? d.info.read.noteKo : "";
   return `
     <div class="hint" aria-label="GTO 엔진 추천 비율">
       <div class="hint-bar">${items.map((i) => `<i class="k-${i.kind}" style="flex-grow:${i.freq.toFixed(3)}"></i>`).join("")}</div>
       <div class="hint-legend">${items.map((i) => `<span><i class="sw k-${i.kind}"></i>${esc(i.label)} <b>${Math.round(i.freq * 100)}%</b></span>`).join("")}${Number.isFinite(eq) ? `<span class="hint-eq">추정 승률 ${Math.round(eq * 100)}%</span>` : ""}</div>
+      ${read ? `<div class="hint-read" title="이번 게임에서 본 것만 (모두가 본 행동 · 쇼다운에 공개된 카드)"><b>읽기</b>${esc(read)}</div>` : ""}
     </div>`;
 }
 
@@ -1244,12 +1350,34 @@ function endHtml() {
       <div><dt>마지막 블라인드</dt><dd>${m.hand.sb}/${m.hand.bb}</dd></div>
       <div><dt>내 VPIP</dt><dd>${vpip}% · ${st.hands}핸드</dd></div>
     </dl>
+    ${seenMeHtml()}
     ${standingsHtml()}
     <div class="modal-actions">
       <button class="btn primary" id="m-again" type="button">다시 하기 · ${n}명</button>
       ${watch}
       <button class="btn" id="m-setup" type="button">인원 바꾸기</button>
     </div>`;
+}
+
+// 혼자 하기 결과 창: 이번 게임에서 AI가 본 나 (모두가 본 행동 · 쇼다운에 공개된 내 카드만)
+function seenMeHtml() {
+  if (!RD || !S.reads) return "";
+  let p;
+  try { p = RD.profile(S.reads, ME); } catch { return ""; }
+  if (!p || !p.hands) return "";
+  const sum = RD.summaryKo(S.reads, ME), verdict = sum.replace(/\s*\([^)]*\)\s*$/, "");
+  const rate = (a, n) => (n ? `${Math.round((100 * a) / n)}%` : "–");
+  const folded = p.faced ? Math.round(p.foldRaw * p.faced) : 0, bets = p.betOpp ? Math.round(p.betRaw * p.betOpp) : 0;
+  return `
+    <section class="seen" aria-labelledby="seen-h">
+      <h2 id="seen-h">AI가 본 나 <small>이번 게임 ${p.hands}판</small></h2>
+      <p class="seen-verdict">${esc(verdict)}</p>
+      <dl class="rules seen-stats">
+        <div><dt>베팅에 접은 비율</dt><dd>${rate(folded, p.faced)} <small>${p.faced}번 중 ${folded}</small></dd></div>
+        <div><dt>먼저 벳한 비율</dt><dd>${rate(bets, p.betOpp)} <small>${p.betOpp}번 중 ${bets}</small></dd></div>
+        <div><dt>드러난 뻥카</dt><dd><small>공개된 벳 ${p.shownN}번 중</small> ${p.shown.bluff}번</dd></div>
+      </dl>
+    </section>`;
 }
 
 const confirmNewHtml = () => `
@@ -1768,6 +1896,7 @@ function newMatchMP() {
     m: PT.createMatch({ players, startStack: START_STACK, levels: LEVELS, handsPerLevel: HANDS_PER_LEVEL }),
     claudeOn: false, depth: "quick",
     stats: { hands: 0, vpip: 0, pfr: 0, aggr: 0, calls: 0, facedBet: 0, foldedToBet: 0, showdowns: [] },
+    reads: newReads(room.n),        // 이번 게임 상대 읽기 (다시 하기 = 새 게임 → 0부터)
     history: [], log: [], logAt: null, say: null, track: null, biggestPot: 0, doneNo: 0, ended: "", watched: false,
     matchId: PokerNet.newToken(10), // 손님이 새 매치를 알아보는 표시
     turn: null,                     // 사람 차례 제한 시간 { key, seat, deadline }
@@ -1775,6 +1904,7 @@ function newMatchMP() {
   };
   fast = false;
   tableKey = controlsKey = logKey = turnKey = "";
+  hint = { key: "", d: null };
   requestWake();
   FX?.fresh();
   startHand();
@@ -1862,6 +1992,7 @@ function loadRoom() {
     if (!PokerNet.normCode(r.code) || !(r.n >= 2 && r.n <= 6) || !Array.isArray(r.guests) || !r.guests.every((g) => tokOk(g?.gid) && tokOk(g?.secret))) return null;
     const S0 = r.started ? d.S : null;
     if (r.started && (!S0?.m?.hand || S0.m.players.length !== r.n || !S0.matchId || !S0.logAt)) return null;
+    if (S0) fixReads(S0);
     return {
       // 손님은 모두 끊긴 상태로 시작한다. 돌아오면 같은 자리 (onReady에서 잠깐 기다릴 시간을 준다)
       room: { code: r.code, n: r.n, hostName: PokerNet.cleanName(r.hostName, "방장"), started: !!r.started,

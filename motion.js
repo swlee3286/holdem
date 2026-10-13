@@ -1,5 +1,5 @@
 // ===== 모션 =====
-// 테이블 위 움직임과 효과음: 카드 나눠 주기 · 보드 뒤집기 · 칩(자리 → 베팅 자리 → 팟 → 이긴 사람) · 폴드 · 올인 · 체크.
+// 테이블 위 움직임과 효과음: 카드 나눠 주기 · 보드 뒤집기 · 칩(자리 → 베팅 자리 → 팟 → 이긴 사람) · 폴드 · 올인 · 체크 · 뻥카 도장.
 // game.js가 화면을 그린 뒤마다 PokerMotion.sync()를 부른다. 직전에 본 상태와 비교해 새로 일어난 일만 보여 주고 들려준다
 // (새 행동 · 스트리트 · 단계 · 결과). 그래서 혼자 하기 · 방장 · 손님(자리별로 걸러진 화면)에서 똑같이 돌고, 처음 그릴 때 ·
 // 이어하기 · 다시 연결 · 같은 화면을 다시 그릴 때는 아무것도 하지 않는다. 남의 카드는 늘 뒷면으로만 움직인다
@@ -359,6 +359,29 @@ function holdFx(t) {
   later(t, () => tb.classList.remove("fx-hold"));
 }
 
+// 쇼다운에서 뻥카가 들켰다(끝까지 약한 패): game.js가 그린 '뻥카!' 표시(.bet .tag.bluff)가 카드가 펴진 뒤 도장처럼 찍힌다. 소리는 핸드에 한 번
+function bluffFx(T, fx) {
+  const tags = [...doc.querySelectorAll(".bet .tag.bluff")];
+  if (!tags.length) return;
+  sfx("bluff", T);
+  if (!fx) return;
+  tags.forEach((el, i) => {
+    if (typeof el.animate !== "function") return;
+    const t = T + i * 90;
+    let a;
+    try {
+      a = el.animate([
+        { opacity: 0, transform: "scale(2.3) rotate(-20deg)" },
+        { opacity: 1, transform: "scale(.88) rotate(-4deg)", offset: 0.55 },
+        { opacity: 1, transform: "scale(1.08) rotate(-8deg)", offset: 0.8 },
+        { opacity: 1, transform: "rotate(-6deg)" }, // style.css의 .tag.bluff와 같은 기울기
+      ], { delay: t, duration: 380, easing: "cubic-bezier(.3,.7,.4,1)", fill: "backwards" });
+    } catch { return; }
+    track(a);
+    note("bluff", Number(el.parentElement?.id?.slice(4)), at(el), t);
+  });
+}
+
 // 핸드 끝: 팟마다 따로 이긴 사람(들)에게 (금액이 적힌 칩). 사이드 팟은 차례로, 나눔이면 각자의 몫이 각자에게
 function potFx(h, me, T, fx) {
   const r = h.result;
@@ -443,6 +466,7 @@ function play(p, h, m, me, fx) {
   T = showFx(newHand ? null : p, h, me, T, fx);
   const fin = h.phase === "done" && (newHand || p.phase !== "done");
   if (fin && fx && h.result?.showdown) holdFx(T);
+  if (fin && h.result?.showdown) bluffFx(T, fx);
   if (fin) T = potFx(h, me, T, fx);
   if (!newHand && p.out[me] === false && m.players[me]?.out) sfx("bust", Math.min(T + 250, 1450)); // 탈락 창(1.6초 뒤)보다 먼저
   // 내 차례가 새로 왔을 때 한 번

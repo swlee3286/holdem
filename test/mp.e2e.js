@@ -11,12 +11,15 @@
 //  E) 아티팩트 진입 파일(artifact.html, PeerJS 없음 · window.claude 있음): 친구와 하기를 끄고 GitHub 주소 안내
 //  F) 소리 · 움직임: 행동마다 맞는 소리(핸드별 개수) · 효과가 끝나면 남지 않음 · 화면 방향 · 다른 탭에서 효과를 지움 ·
 //     새로고침 · 이어하기에 소리 없음 · 소리 끄기 버튼(40px · aria-pressed · 새로고침해도 기억) · 동작 줄이기에서 움직임 없음
+//  G) 뻥카 읽기: 카드를 정해 둔 핸드에서 쇼다운에 드러난 뻥카 → '뻥카!' 도장 · 기록 줄 · 소리 한 번 · 이번 게임 읽기에 기록,
+//     새로고침하면 읽기 그대로 · 새 게임이면 0부터, 동작 줄이기에서는 도장만(움직임 없이), 친구와 하기(?net=local)는 방장 · 손님 모두 같은 표시
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const netm = require("net");
 const { chromium } = require("playwright");
 const { PeerServer } = require("peer");
+const READS = require("../reads.js");
 
 const ROOT = path.resolve(__dirname, "..");
 const HANDS_A = Number(process.env.HANDS_A) || 25;
@@ -437,6 +440,9 @@ async function scenarioC(browser, web) {
   }
   console.log(`   핸드 ${hands.size}, 내 수 ${moves}`);
   ok(hands.size >= HANDS_C, `혼자 하기 핸드 수 ${hands.size}`);
+  // 이번 게임 읽기: 끝난 핸드마다 한 번씩 (지금 핸드가 끝났으면 그것까지)
+  const rd = await page.evaluate(() => ({ ok: PokerReads.valid(S.reads, S.m.players.length), last: S.reads.last, hands: S.reads.hands, no: S.m.hand.no, done: S.m.hand.phase === "done" }));
+  ok(rd.ok && rd.last === (rd.done ? rd.no : rd.no - 1) && rd.hands === rd.last, "혼자 하기 읽기 기록 " + JSON.stringify(rd));
   await ctx.close();
 }
 
@@ -567,6 +573,7 @@ function expectedSounds(h, me, busted) {
   if (won) add("win");
   for (let i = 0; i < h.result.pots.length - (won ? 1 : 0); i++) add("chip"); // 팟이 이긴 사람에게 갈 때
   if (h.seats.some((s) => s !== me && !h.folded[s] && h.shown[s])) add("flip"); // 남의 카드 공개
+  if (READS.revealed(h).some((x) => x.label === "bluff" && x.weakEnd && !(h.result.won[x.seat] > 0))) add("bluff"); // 쇼다운에서 들킨 뻥카 (팟을 못 가져간 자리, 핸드에 한 번)
   return e;
 }
 const countBy = (list) => list.reduce((c, x) => ((c[x] = (c[x] || 0) + 1), c), {});
@@ -695,10 +702,176 @@ async function scenarioF(browser, web) {
   await rctx.close();
 }
 
+// ===== G) 뻥카 읽기 =====
+// 다음 핸드의 카드를 정한다: window.__force = { holes: {자리: "7c 2d"}, other: ["Ah Ad", ...](나머지 자리 차례로), board: "As Jd 9c 4s 3h" }
+function forcePatch() {
+  const C = (t) => RANKS.indexOf(t[0]) * 4 + SUITS.indexOf(t[1]);
+  const cards = (str) => str.split(" ").filter(Boolean).map(C);
+  const orig = PokerTable.startHand;
+  PokerTable.startHand = (m, d) => {
+    const r = orig(m, d);
+    const f = window.__force;
+    if (!f) return r;
+    window.__force = null;
+    window.__forcedNo = m.hand.no;
+    const h = m.hand, used = new Set(), other = f.other.slice();
+    for (const s of h.seats) { h.hole[s] = cards(f.holes[s] || other.shift()); h.hole[s].forEach((c) => used.add(c)); }
+    const b = cards(f.board);
+    b.forEach((c) => used.add(c));
+    const rest = [...Array(52).keys()].filter((c) => !used.has(c));
+    const burn = () => rest.pop();
+    const b1 = burn(), b2 = burn(), b3 = burn();
+    h.deck = [...rest, b[4], b3, b[3], b2, b[2], b[1], b[0], b1]; // 뒤에서부터: 번 · 플롭 3 · 번 · 턴 · 번 · 리버
+    return r;
+  };
+}
+// 정해 둔 핸드의 내 수: bluffer면 플롭부터 스트리트마다 한 번 가장 작게 벳/레이즈(그 뒤엔 콜), "fold"면 베팅에 접고, 아니면 체크 · 콜만
+async function forcedMove(page, how) {
+  const o = await page.evaluate(() => {
+    const h = S.m.hand, mine = h.actions.some((a) => a.street === h.street && a.seat === ME && (a.type === "bet" || a.type === "raise"));
+    return { street: h.street, mine, raise: !!document.getElementById("b-raise") && !document.getElementById("b-raise").disabled, fold: !!document.getElementById("b-fold") && !document.getElementById("b-fold").disabled };
+  });
+  if (how === true && o.street > 0 && !o.mine && o.raise) {
+    await page.evaluate(() => setAmount(PokerTable.legal(S.m, ME).minTo));
+    await page.click("#b-raise");
+  } else if (how === "fold" && o.fold) await page.click("#b-fold");
+  else await page.click("#b-call");
+}
+const bluffState = (page, no) => page.evaluate((no) => ({
+  no: S.m.hand.no, phase: S.m.hand.phase, tags: [...document.querySelectorAll(".bet .tag.bluff")].map((t) => Number(t.parentElement.id.slice(4))),
+  log: S.log.filter((l) => l.includes("bluff-line")), snd: typeof __snd === "object" ? __snd.filter((x) => x.no === no && x.n === "bluff").length : -1,
+  stamp: PokerMotion.log.filter((x) => x.no === no && x.ev === "bluff").length, anim: [...document.querySelectorAll(".bet .tag.bluff")].reduce((t, el) => t + el.getAnimations().length, 0),
+  reads: typeof S.reads === "object" && S.reads ? { last: S.reads.last, bluff: S.reads.seats.map((z) => z.shown.bluff) } : null,
+}), no);
+// 지금 핸드를 끝까지 (내 차례마다 how대로)
+async function playOut(page, how) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < 60000) {
+    const s = await page.evaluate(() => ({ phase: S.m.hand.phase, mine: document.getElementById("controls").classList.contains("mine") }));
+    if (s.phase === "done") return true;
+    if (s.mine) { await sleep(400); await forcedMove(page, how); }
+    await sleep(120);
+  }
+  return false;
+}
+
+// 혼자 하기 헤즈업: 나 7♣2♦ (플롭부터 가장 작게 벳 · 레이즈, 그 뒤엔 콜) vs Claude 자리(엔진) A♥A♦ — 쇼다운에 내 뻥카
+async function soloBluffHand(page, tag) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await page.evaluate(() => { window.__force = { holes: { 0: "7c 2d" }, other: ["Ah Ad"], board: "As Jd 9c 4s 3h" }; });
+    await page.click("#next");
+    await page.waitForFunction(() => window.__forcedNo === S.m.hand.no, null, { timeout: 10000 });
+    const no = await page.evaluate(() => S.m.hand.no);
+    await playOut(page, true);
+    await page.waitForFunction(() => PokerMotion.active() === 0, null, { timeout: 8000 }).catch(() => {});
+    await sleep(300);
+    const st = await bluffState(page, no);
+    if (st.tags.length || attempt === 2 || !(await page.$("#next"))) return st;
+    console.log(`   ${tag}: 정해 둔 핸드가 쇼다운까지 가지 않아 다시 (${attempt + 1})`);
+  }
+}
+
+async function scenarioG(browser, web) {
+  console.log("G) 뻥카 읽기: 도장 · 기록 · 소리 · 이번 게임만");
+  const base = `http://127.0.0.1:${web.port}/index.html`;
+  // 1) 혼자 하기 · 넓은 화면: 첫 핸드는 접기만 → 새로고침해도 읽기 그대로 → 정해 둔 핸드 → 새 게임이면 0부터
+  const ctx = await browser.newContext(DESKTOP);
+  await ctx.addInitScript(soundHook);
+  const page = await newPage(ctx, "G-solo");
+  await page.goto(base);
+  await page.click("[data-count='2']");
+  await page.click("#m-start");
+  await playOut(page, "fold");
+  const before = await page.evaluate(() => JSON.stringify(S.reads));
+  ok(JSON.parse(before).last === 1, "첫 핸드가 읽기에 기록됨 " + before.slice(0, 60));
+  await page.reload();
+  ok((await page.evaluate(() => JSON.stringify(S.reads))) === before, "새로고침해도 같은 게임의 읽기는 그대로");
+  await page.click("#m-resume");
+  await sleep(400);
+  await page.evaluate(forcePatch);
+  const st = await soloBluffHand(page, "G-solo");
+  console.log(`   혼자 하기: 핸드 ${st.no} 도장 ${JSON.stringify(st.tags)} · 기록 ${st.log.length} · 소리 ${st.snd} · 찍힘 ${st.stamp} · 읽기 ${JSON.stringify(st.reads)}`);
+  ok(st.tags.includes(0) && st.log.some((l) => l.includes("내 뻥카가 들켰어요")) && st.snd === 1 && st.stamp >= 1 && st.anim === 0, "혼자 하기 뻥카 도장 · 기록 · 소리 한 번 · 움직임 끝 " + JSON.stringify(st));
+  ok(st.reads && st.reads.last === st.no && st.reads.bluff[0] >= 1, "이번 게임 읽기에 내 뻥카 기록 " + JSON.stringify(st.reads));
+  // 새 게임: 0부터 (졌으면 결과 창의 다시 하기, 아니면 새 게임 → 설정 → 시작)
+  await sleep(1900);
+  if (await page.$("#m-again")) await page.click("#m-again");
+  else {
+    await page.click("#new-game");
+    if (await page.$("#m-setup")) await page.click("#m-setup");
+    await page.click("#m-start");
+  }
+  const fresh = await page.evaluate(() => ({ no: S.m.hand.no, hands: S.reads.hands, last: S.reads.last, sum: S.reads.seats.reduce((t, z) => t + z.hands + z.shown.bluff, 0) }));
+  ok(fresh.no === 1 && fresh.hands === 0 && fresh.last === 0 && fresh.sum === 0, "새 게임이면 읽기 0부터 " + JSON.stringify(fresh));
+  await ctx.close();
+
+  // 2) 동작 줄이기 · 폰: 도장은 보이지만 움직이지 않고, 소리는 난다
+  const rctx = await browser.newContext({ ...MOBILE, reducedMotion: "reduce" });
+  await rctx.addInitScript(soundHook);
+  const rp = await newPage(rctx, "G-reduce");
+  await rp.goto(base);
+  await rp.click("[data-count='2']");
+  await rp.click("#m-start");
+  await playOut(rp, "fold");
+  await rp.evaluate(forcePatch);
+  const rs = await soloBluffHand(rp, "G-reduce");
+  const vis = await rp.evaluate(() => { const t = document.querySelector(".bet .tag.bluff"); if (!t) return null; const r = t.getBoundingClientRect(), cs = getComputedStyle(t); return { w: Math.round(r.width), h: Math.round(r.height), op: cs.opacity, anims: document.getAnimations().length }; });
+  ok(rs.tags.includes(0) && rs.snd === 1 && rs.stamp === 0 && vis && vis.w > 20 && vis.op === "1" && vis.anims === 0, "동작 줄이기: 도장은 보이고 움직임 없음 · 소리 한 번 " + JSON.stringify({ rs, vis }));
+  await rctx.close();
+
+  // 3) 친구와 하기 (?net=local): 방장 K♥K♦ (체크 · 콜) vs 손님 7♣2♦ (가장 작게 벳) — 두 화면 모두 손님 자리에 도장
+  const nbase = `${base}?net=local`;
+  const mctx = await browser.newContext(DESKTOP);
+  await mctx.addInitScript(soundHook);
+  const host = await newPage(mctx, "G-host");
+  await host.goto(`${nbase}&nextSec=30`);
+  await host.click("#tab-mp");
+  await host.fill("#mp-name", "방장G");
+  await host.click("#mp-host");
+  await host.waitForFunction(() => room && room.ready, null, { timeout: 10000 });
+  await host.click("[data-mpn='2']");
+  const code = await host.evaluate(() => room.code);
+  const g = await joinGuest(mctx, nbase, code, "손님G", "G-guest");
+  await g.setViewportSize({ width: 390, height: 844 });
+  await host.waitForFunction(() => room.guests.length === 1 && room.guests[0].connected, null, { timeout: 10000 });
+  await host.evaluate(forcePatch);
+  await host.evaluate(() => { window.__force = { holes: { 0: "Kh Kd", 1: "7c 2d" }, other: [], board: "As Jd 9c 4s 3h" }; });
+  await host.click("#mp-start");
+  await g.waitForFunction(() => S && S.m && S.m.hand && modalScreen === "", null, { timeout: 10000 });
+  const no = await host.evaluate(() => S.m.hand.no);
+  const t0 = Date.now();
+  while (Date.now() - t0 < 90000) {
+    const hs = await host.evaluate(() => ({ phase: S.m.hand.phase, toAct: S.m.hand.toAct }));
+    if (hs.phase === "done") break;
+    for (const [pg, seat, how] of [[host, 0, false], [g, 1, true]]) {
+      const s = await pg.evaluate(() => ({ mine: document.getElementById("controls").classList.contains("mine"), pending: mode === "guest" ? !!guest.pending : false }));
+      if (hs.phase === "bet" && hs.toAct === seat && s.mine && !s.pending) { await sleep(400); await forcedMove(pg, how); }
+    }
+    await sleep(150);
+  }
+  await g.waitForFunction((no) => S.m.hand.no === no && S.m.hand.phase === "done", no, { timeout: 10000 }).catch(() => {});
+  for (const pg of [host, g]) await pg.waitForFunction(() => PokerMotion.active() === 0, null, { timeout: 8000 }).catch(() => {});
+  await sleep(300);
+  const hb = await bluffState(host, no), gb = await bluffState(g, no);
+  console.log(`   친구와 하기: 방장 도장 ${JSON.stringify(hb.tags)} 소리 ${hb.snd} · 손님 도장 ${JSON.stringify(gb.tags)} 소리 ${gb.snd} · 손님 기록 ${JSON.stringify(gb.log)}`);
+  ok(hb.tags.includes(1) && gb.tags.includes(1) && hb.snd === 1 && gb.snd === 1, "친구와 하기: 방장 · 손님 모두 손님 자리에 도장 · 소리 한 번 " + JSON.stringify({ hb, gb }));
+  ok(hb.log.some((l) => l.includes("손님G</b> 뻥카였어요")) && gb.log.some((l) => l.includes("내 뻥카가 들켰어요")), "친구와 하기: 기록 줄 (방장: 이름 · 손님: 내 뻥카)");
+  ok(hb.reads && hb.reads.bluff[1] >= 1 && gb.reads === null, "읽기는 방장만 (손님은 받은 화면으로 표시만) " + JSON.stringify([hb.reads, gb.reads]));
+  // 사람에게 보여 주는 읽기(명패 툴팁)는 혼자 하기만: 친구와 하기에서는 방장 · 손님 모두 없다
+  const tips = async (pg) => pg.evaluate(() => [...document.querySelectorAll(".plate")].map((p) => p.title).filter(Boolean));
+  const ht = await tips(host), gt = await tips(g);
+  ok(ht.length === 0 && gt.length === 0, "친구와 하기: 명패 읽기 툴팁 없음 (방장 · 손님 같게) " + JSON.stringify([ht, gt]));
+  // 다시 하기(같은 방 새 게임) = 새 읽기
+  await host.evaluate(() => { newMatchMP(); lobbyBroadcast(); });
+  const mf = await host.evaluate(() => ({ hands: S.reads.hands, last: S.reads.last, bluff: S.reads.seats.map((z) => z.shown.bluff) }));
+  ok(mf.hands === 0 && mf.last === 0 && mf.bluff.every((x) => x === 0), "다시 하기 = 새 게임 → 읽기 0부터 " + JSON.stringify(mf));
+  await mctx.close();
+}
+
 (async () => {
   const web = await staticServer();
   const browser = await chromium.launch();
-  const only = process.env.ONLY || "ABCDEF";
+  const only = process.env.ONLY || "ABCDEFG";
   try {
     if (only.includes("A")) await scenarioA(browser, web);
     if (only.includes("B")) await scenarioB(browser, web);
@@ -706,6 +879,7 @@ async function scenarioF(browser, web) {
     if (only.includes("D")) await scenarioD(browser, web);
     if (only.includes("E")) await scenarioE(browser, web);
     if (only.includes("F")) await scenarioF(browser, web);
+    if (only.includes("G")) await scenarioG(browser, web);
   } catch (e) {
     ok(false, "예외: " + (e && e.stack || e));
   }
